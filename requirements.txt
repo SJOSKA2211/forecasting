@@ -22,6 +22,7 @@ plotly>=5.18.0
 kaleido>=0.2.1 # Added Kaleido for saving Plotly images
 # If you need interactive HTML exports, you don't need kaleido, but for static images it's necessary.
 
+
 altair>=5.2.0 # Optional: Add if you plan to use Altair visualizations
 
 # Utilities
