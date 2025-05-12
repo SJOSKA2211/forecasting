@@ -1,33 +1,14 @@
-# Core data manipulation and analysis
-pandas>=1.2.0
-numpy>=1.21.0
-
-# Machine learning
-scikit-learn>=1.2.0
-
-# Time series forecasting
-statsmodels>=0.14.0
-pmdarima>=2.0.3
-
-# Deep learning
-tensorflow==2.15.0
-# Note: This specific TensorFlow version is used. If deployment fails,
-# consider trying a different widely compatible version or checking
-# Streamlit Cloud documentation for recommended TensorFlow versions.
-
-# Visualization and Streamlit GUI
-streamlit>=1.30.0
-matplotlib>=3.7.0
-seaborn>=0.13.0
-plotly>=5.18.0
-kaleido>=0.2.1 # Needed for saving static Plotly images
-
-# Optional visualization library (if used)
-# altair>=5.2.0
-
-# Utilities
-joblib>=1.2.0
-
-# Additional dependencies that might be needed
-scipy>=1.10.0
-openpyxl>=3.1.0 # Needed for reading .xlsx files
+pandas>=1.5.0,<2.2.0
+numpy>=1.26.0,<2.0.0
+scikit-learn>=1.2.0,<1.5.0
+statsmodels>=0.14.0,<0.15.0
+pmdarima>=2.0.3,<2.1.0
+tensorflow==2.15.0 # Or tensorflow-gpu if preferred and set up
+streamlit>=1.30.0,<1.35.0
+matplotlib>=3.7.0,<3.9.0
+plotly>=5.18.0,<5.21.0
+joblib>=1.2.0,<1.4.0
+scipy>=1.10.0,<1.13.0
+openpyxl>=3.1.0,<3.2.0 # For reading .xlsx files
+holidays>=0.38 # For holiday calendar features
+seaborn>=0.12.0,<0.14.0 # Added for enhanced plotting (histplot, boxplot)
