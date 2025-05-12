@@ -231,6 +231,12 @@ def run_all_forecasts(df_processed, current_app_config, models_to_run):
         # Split into train and test sets
         train_series = series[:-test_size_points]
         test_series = series[-test_size_points:]
+        
+        if len(train_series) == 0 or len(test_series) == 0:
+            st.warning(f"Skipping group '{group_id_str}': Not enough data after train-test split. Train size: {len(train_series)}, Test size: {len(test_series)}")
+            metrics_list.append(group_metrics)
+            continue
+
 
         # Create forecast DataFrame
         group_forecast_df = pd.DataFrame(index=test_series.index)
@@ -242,6 +248,7 @@ def run_all_forecasts(df_processed, current_app_config, models_to_run):
 
         # ======================= ARIMA FORECASTING =======================
         if "ARIMA" in models_to_run:
+            st.info(f"Preparing ARIMA for group: {group_id_str}")
             try:
                 status_text.text(f"Running ARIMA for group: {group_id_str}")
 
@@ -301,6 +308,7 @@ def run_all_forecasts(df_processed, current_app_config, models_to_run):
                     'residuals': test_series.values - arima_forecast,
                     'fitted': arima_forecast
                 }
+                st.info(f"ARIMA completed for group: {group_id_str}")
 
             except Exception as e:
                 st.warning(f"ARIMA failed for group {group_id_str}: {str(e)}")
@@ -309,6 +317,7 @@ def run_all_forecasts(df_processed, current_app_config, models_to_run):
 
         # ======================= DATA PREPARATION FOR NN/LSTM =======================
         if "LSTM" in models_to_run or "Simple NN" in models_to_run:
+            st.info(f"Preparing data for NN/LSTM for group: {group_id_str}")
             try:
                 # Scale the data
                 scaler = MinMaxScaler(feature_range=(0, 1))
@@ -326,6 +335,7 @@ def run_all_forecasts(df_processed, current_app_config, models_to_run):
                 # Ensure we have enough sequences
                 if len(X_train) == 0 or len(X_test) == 0:
                     raise ValueError(f"Not enough data to create sequences with lookback {lookback_window}")
+                st.info(f"NN/LSTM data prepared for group: {group_id_str}")
 
             except Exception as e:
                 st.error(f"NN/LSTM data preparation failed for group {group_id_str}: {str(e)}")
@@ -336,6 +346,7 @@ def run_all_forecasts(df_processed, current_app_config, models_to_run):
 
         # ======================= LSTM FORECASTING =======================
         if "LSTM" in models_to_run and len(X_train) > 0:
+            st.info(f"Preparing LSTM for group: {group_id_str}")
             try:
                 status_text.text(f"Running LSTM for group: {group_id_str}")
 
@@ -398,6 +409,7 @@ def run_all_forecasts(df_processed, current_app_config, models_to_run):
                     'residuals': test_series.values - lstm_forecast,
                     'fitted': lstm_forecast
                 }
+                st.info(f"LSTM completed for group: {group_id_str}")
 
             except Exception as e:
                 st.warning(f"LSTM failed for group {group_id_str}: {str(e)}")
@@ -406,6 +418,7 @@ def run_all_forecasts(df_processed, current_app_config, models_to_run):
 
         # ======================= SIMPLE NN FORECASTING =======================
         if "Simple NN" in models_to_run and len(X_train) > 0:
+            st.info(f"Preparing Simple NN for group: {group_id_str}")
             try:
                 status_text.text(f"Running Simple NN for group: {group_id_str}")
 
@@ -471,6 +484,7 @@ def run_all_forecasts(df_processed, current_app_config, models_to_run):
                     'residuals': test_series.values - nn_forecast,
                     'fitted': nn_forecast
                 }
+                st.info(f"Simple NN completed for group: {group_id_str}")
 
             except Exception as e:
                 st.warning(f"Simple NN failed for group {group_id_str}: {str(e)}")
@@ -1337,35 +1351,45 @@ if st.session_state.df_original is not None:
         if not models_to_run:
             st.warning("Please select at least one model to run.")
         else:
+            st.session_state.forecast_results_ready = False # Reset flag before new run
+            st.session_state.evaluation_df = None
+            st.session_state.consolidated_forecast_df = None
+
             with st.spinner("Processing data and running forecasts... This may take a while."):
                 # Data preprocessing steps
                 try:
                     # Convert date column to datetime objects
+                    st.info(f"Converting '{date_column}' to datetime.")
                     st.session_state.df_processed[date_column] = pd.to_datetime(st.session_state.df_processed[date_column])
+                    
                     # Handle missing values in target column (e.g., fill with median or mean)
                     if st.session_state.df_processed[target_column].isnull().any():
                         st.warning(f"Missing values found in '{target_column}'. Filling with median.")
                         st.session_state.df_processed[target_column].fillna(st.session_state.df_processed[target_column].median(), inplace=True)
-
+                    
                     # Ensure target column is numeric
+                    st.info(f"Ensuring '{target_column}' is numeric.")
                     st.session_state.df_processed[target_column] = pd.to_numeric(st.session_state.df_processed[target_column], errors='coerce')
                     if st.session_state.df_processed[target_column].isnull().any():
                         st.error(f"Target column '{target_column}' contains non-numeric values after conversion. Please clean your data.")
                         st.stop()
 
                     # Ensure sorted by date for time series analysis
+                    st.info("Sorting data by date.")
                     st.session_state.df_processed = st.session_state.df_processed.sort_values(by=date_column)
-
+                    
+                    st.info("Starting model training and forecasting.")
                     run_all_forecasts(st.session_state.df_processed, current_app_config, models_to_run)
+                    
                 except Exception as e:
-                    st.error(f"Error during data processing or forecasting setup: {e}")
-                    st.session_state.forecast_results_ready = False # Reset flag
+                    st.error(f"An unexpected error occurred during data processing or forecasting: {e}")
+                    st.session_state.forecast_results_ready = False # Ensure flag is false on error
             st.rerun() # Replaced st.experimental_rerun with st.rerun
 
     if st.session_state.forecast_results_ready:
         st.subheader("Forecasting Results")
-
         if st.session_state.evaluation_df is not None and not st.session_state.evaluation_df.empty:
+            st.info("Displaying results now.")
             # Determine groups for selection
             display_groups = ['Overall']
             if group_column and group_column in st.session_state.df_processed.columns:
@@ -1376,8 +1400,7 @@ if st.session_state.df_original is not None:
                 display_groups
             )
 
-            group_id_for_display = selected_group if selected_group != 'Overall' else None
-
+            # The enhanced_display_model_performance function takes 'group_id' which can be 'Overall' or actual group name
             enhanced_display_model_performance(
                 group_id=selected_group,
                 consolidated_df=st.session_state.consolidated_forecast_df,
@@ -1392,7 +1415,9 @@ if st.session_state.df_original is not None:
                 plot_df_eda_source=st.session_state.df_processed # Pass processed DF for EDA
             )
         else:
-            st.warning("No forecasting results available. Please upload data and run forecasts.")
+            st.warning("Forecasting completed, but no results could be generated. Please check your data or console for errors.")
+            st.info("This might happen if there was insufficient data for train/test split or if all models failed for all groups.")
+
 
 else:
     st.info("Please upload a CSV or Excel file to get started with demand forecasting.")
