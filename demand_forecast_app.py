@@ -1346,7 +1346,7 @@ if st.session_state.df_original is not None:
                     if st.session_state.df_processed[target_column].isnull().any():
                         st.warning(f"Missing values found in '{target_column}'. Filling with median.")
                         st.session_state.df_processed[target_column].fillna(st.session_state.df_processed[target_column].median(), inplace=True)
-                    
+
                     # Ensure target column is numeric
                     st.session_state.df_processed[target_column] = pd.to_numeric(st.session_state.df_processed[target_column], errors='coerce')
                     if st.session_state.df_processed[target_column].isnull().any():
@@ -1355,12 +1355,12 @@ if st.session_state.df_original is not None:
 
                     # Ensure sorted by date for time series analysis
                     st.session_state.df_processed = st.session_state.df_processed.sort_values(by=date_column)
-                    
+
                     run_all_forecasts(st.session_state.df_processed, current_app_config, models_to_run)
                 except Exception as e:
                     st.error(f"Error during data processing or forecasting setup: {e}")
                     st.session_state.forecast_results_ready = False # Reset flag
-            st.experimental_rerun() # Rerun to show results after calculations complete
+            st.rerun() # Replaced st.experimental_rerun with st.rerun
 
     if st.session_state.forecast_results_ready:
         st.subheader("Forecasting Results")
