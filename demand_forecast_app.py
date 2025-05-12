@@ -17,6 +17,11 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from scipy import stats
 import holidays
 
+# Suppress TensorFlow warnings and info messages
+# '0' for all logs, '1' for info, '2' for warnings, '3' for errors
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 
 def create_sequences(data, n_steps_in, n_steps_out=1):
     """
@@ -288,15 +293,16 @@ def run_all_forecasts(df_processed, current_app_config, models_to_run):
                 lower_bound = pred_interval.iloc[:, 0]
                 upper_bound = pred_interval.iloc[:, 1]
 
-                # Store prediction intervals
-                group_forecast_df['ARIMA_Lower'] = lower_bound.values
-                group_forecast_df['ARIMA_Upper'] = upper_bound.values
-
                 # Store for later use
                 arima_pi_data[group_id_str] = {
                     'lower': lower_bound.values,
                     'upper': upper_bound.values
                 }
+
+                # Store prediction intervals
+                group_forecast_df['ARIMA_Lower'] = lower_bound.values
+                group_forecast_df['ARIMA_Upper'] = upper_bound.values
+
 
                 # Calculate metrics
                 arima_metrics = evaluate_forecast(test_series.values, arima_forecast)
