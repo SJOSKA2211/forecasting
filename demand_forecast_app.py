@@ -1,1464 +1,1398 @@
-# demand_forecast_app.py
 import pandas as pd
 import numpy as np
-import os
-import time # Import time for potential timing or pauses
-# import matplotlib.pyplot as plt # Matplotlib will be used with Streamlit
-from sklearn.preprocessing import StandardScaler
-from statsmodels.tsa.arima.model import ARIMA # For ARIMA and MA models
-from pmdarima import auto_arima # For automatic ARIMA selection
+import time
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from statsmodels.tsa.arima.model import ARIMA
+from pmdarima import auto_arima
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout, InputLayer, Bidirectional # Include Dense for NN
+from tensorflow.keras.layers import LSTM, Dense, Dropout, InputLayer, Bidirectional, Flatten
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from tensorflow.keras.optimizers import Adam # Import Adam optimizer
-import joblib # For saving/loading ARIMA model and scalers
-import warnings
-import sys
-import traceback # For detailed error reporting
-import streamlit as st # Import Streamlit
-import matplotlib.pyplot as plt # Import Matplotlib for Streamlit plotting
-import seaborn as sns # Import Seaborn
-import plotly.express as px # Import Plotly
-import plotly.graph_objects as go # Import Plotly Graph Objects
-# import altair as alt # Import Altair if needed
-from concurrent.futures import ProcessPoolExecutor, as_completed # Import for parallel processing
-import plotly.io as pio # Import plotly.io for saving images
-
-warnings.filterwarnings('ignore') # Ignore some common warnings
-
-# Set random seed for reproducibility
-np.random.seed(42)
-tf.random.set_seed(42)
-
-# Disable TensorFlow verbosity for cleaner process output
-os.environ['TF_CPP_CPP_MIN_LOG_LEVEL'] = '3' # Suppress TensorFlow logging
-tf.get_logger().setLevel('ERROR') # Suppress TensorFlow logger
-
-st.set_page_config(layout="wide") # Use wide layout for Streamlit app
-
-st.title("Demand Forecasting Application")
-st.write("This application forecasts demand using ARIMA, MA, NN, LSTM, and Hybrid ARIMA-LSTM models.")
-
-# --- Check for GPU ---
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    st.success(f"Detected GPUs: {gpus[0].name}. TensorFlow will attempt to use the GPU for faster training.")
-else:
-    st.warning("No GPU detected. TensorFlow will use the CPU, which may be slower for deep learning models.")
-
-# --- Step 0: Configuration ---
-st.header("Configuration")
-
-# Use Streamlit inputs for configuration
-data_full_file_path = st.text_input("Enter the full path to the sales data file (CSV or Excel):", "sales_data.csv") # Added a default
-date_column = st.text_input("Enter the exact name of the date column:", "Date") # Added a default
-sales_column = st.text_input("Enter the exact name of the sales/demand column:", "Sales") # Added a default
-grouping_column = st.text_input("Enter the exact name of the grouping column (e.g., Store, Product ID):", "StoreID") # Added a default
-
-time_series_frequency = st.text_input("Enter the time series frequency (e.g., 'D' for daily, 'W' for weekly, 'M' for monthly - used for ARIMA/MA seasonality). Leave empty to auto-detect:", "") # Added frequency input
-
-test_size_days = st.number_input("Enter the number of days for the test set (e.g., 90):", min_value=1, value=90)
-lstm_look_back = st.number_input("Enter the look-back period for LSTM/NN (e.g., 30 days):", min_value=1, value=30) # Lookback used for NN too
-
-st.subheader("Model Selection")
-use_arima_model = st.checkbox("Include ARIMA Model?", value=True)
-use_ma_model = st.checkbox("Include MA (Moving Average) Model?", value=True)
-ma_q_order = st.number_input("MA (q) order (typically based on seasonality, e.g., 7 for daily data with weekly seasonality):", min_value=1, value=7, disabled=not use_ma_model)
-use_nn_model = st.checkbox("Include NN (Neural Network) Model?", value=True)
-nn_layers = st.number_input("NN Layers (e.g., 2):", min_value=1, value=2, disabled=not use_nn_model)
-nn_units = st.number_input("NN Units per layer (e.g., 64):", min_value=1, value=64, disabled=not use_nn_model)
-use_lstm_model = st.checkbox("Include LSTM Model?", value=True)
-use_bidirectional_lstm = st.checkbox("Use Bidirectional LSTM?", value=True, disabled=not use_lstm_model)
-use_hybrid_model = st.checkbox("Include Hybrid ARIMA-LSTM Model?", value=True and use_arima_model and use_lstm_model, disabled=not (use_arima_model and use_lstm_model)) # Hybrid requires ARIMA and LSTM
-
-st.subheader("Training Parameters")
-lstm_epochs = st.number_input("Enter the number of epochs for NN/LSTM training (Early Stopping will likely stop sooner):", min_value=1, value=100) # Increased default epochs, relying on ES
-lstm_batch_size = st.number_input("Enter the batch size for NN/LSTM training (e.g., 32):", min_value=1, value=32)
-
-st.subheader("Other Settings")
-add_lagged_features = st.checkbox("Add simple lagged features (lag 1 and lag 7)?", value=True) # Option for lagged features
-max_workers = st.slider("Number of parallel processes (adjust based on your CPU cores):", 1, os.cpu_count(), os.cpu_count() // 2 or 1) # Use half of available cores by default
-
-output_dir = st.text_input("Enter the directory path to save results (models, forecasts, plots):", "forecast_results") # Added a default
-
-# Button to start the process
-start_button = st.button("Start Forecasting")
-
-# Global lists/dicts to store results from parallel processing
-all_evaluation_metrics_list = []
-all_forecasts_dict = {}
-all_test_data_dict = {}
-all_residual_plots_data = {} # To store data for residual plots
-all_lstm_history_data = {} # To store LSTM training history
-all_nn_history_data = {} # To store NN training history
-all_errors_list = [] # To store errors from parallel processes
-
-df = None # Initialize df
-
-# --- Helper Functions for Sequence Models (LSTM/NN) ---
-def create_sequence_dataset(dataset, look_back=1):
-    """Create input dataset for sequence models (LSTM/NN)."""
-    dataX, dataY = [], []
-    # Ensure dataset is numpy array before slicing
-    dataset = np.array(dataset)
-    # Check if dataset has enough samples for look_back
-    if len(dataset) <= look_back:
-        return np.array([]), np.array([]) # Return empty arrays if not enough data
-
-    for i in range(len(dataset) - look_back):
-        a = dataset[i:(i + look_back), :] # Capture all features for input sequence
-        dataX.append(a)
-        dataY.append(dataset[i + look_back, 0]) # Predict only the sales column (index 0)
-    # Reshape X for sequence models (n_samples, look_back, n_features)
-    return np.array(dataX), np.array(dataY)
+import matplotlib.pyplot as plt
+import streamlit as st
+import plotly.express as px
+import seaborn as sns
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from scipy import stats
+import holidays
 
 
-def build_lstm_model(look_back, features=1, bidirectional=False):
-    """Builds the LSTM model."""
-    model = Sequential(name=f"{'Bi' if bidirectional else ''}LSTM_Model")
-    model.add(InputLayer(input_shape=(look_back, features)))
+def create_sequences(data, n_steps_in, n_steps_out=1):
+    """
+    Create input/output sequences for time series forecasting.
+
+    Args:
+        data: Array of time series data
+        n_steps_in: Number of time steps for input (lookback window)
+        n_steps_out: Number of time steps to predict (forecast horizon)
+
+    Returns:
+        X: Input sequences
+        y: Target sequences
+    """
+    X, y = [], []
+    for i in range(len(data) - n_steps_in - n_steps_out + 1):
+        X.append(data[i:(i + n_steps_in)])
+        y.append(data[(i + n_steps_in):(i + n_steps_in + n_steps_out)])
+
+    return np.array(X), np.array(y)
+
+
+def create_lstm_model(input_shape, lstm_units=50, dropout_rate=0.2, bidirectional=False):
+    """
+    Create an LSTM model for time series forecasting.
+
+    Args:
+        input_shape: Shape of input data (timesteps, features)
+        lstm_units: Number of LSTM units
+        dropout_rate: Dropout rate for regularization
+        bidirectional: Whether to use Bidirectional LSTM
+
+    Returns:
+        model: Compiled LSTM model
+    """
+    model = Sequential()
 
     if bidirectional:
-        model.add(Bidirectional(LSTM(50, return_sequences=True)))
+        model.add(Bidirectional(LSTM(lstm_units, return_sequences=True), input_shape=input_shape))
     else:
-        model.add(LSTM(50, return_sequences=True))
+        model.add(LSTM(lstm_units, return_sequences=True, input_shape=input_shape))
 
-    model.add(Dropout(0.2))
+    model.add(Dropout(dropout_rate))
 
     if bidirectional:
-         model.add(Bidirectional(LSTM(50)))
+        model.add(Bidirectional(LSTM(lstm_units // 2)))
     else:
-         model.add(LSTM(50))
+        model.add(LSTM(lstm_units // 2))
 
-    model.add(Dropout(0.2))
-    model.add(Dense(1)) # Output is a single value (sales forecast)
-    model.compile(loss='mean_squared_error', optimizer='adam')
-    return model
+    model.add(Dropout(dropout_rate))
+    model.add(Dense(1))
 
-def build_nn_model(look_back, features=1, num_layers=2, units=64):
-    """Builds a Feedforward Neural Network (MLP) model for time series."""
-    model = Sequential(name="NN_Model")
-    # Flatten the look_back window and features into a single input layer
-    model.add(InputLayer(input_shape=(look_back, features)))
-    model.add(tf.keras.layers.Flatten()) # Flatten the input sequence
-
-    # Add Dense layers
-    for _ in range(num_layers):
-        model.add(Dense(units, activation='relu'))
-        model.add(Dropout(0.2))
-
-    model.add(Dense(1)) # Output layer
-    model.compile(loss='mean_squared_error', optimizer='adam')
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
     return model
 
 
-# --- Feature Engineering Function ---
-def create_lagged_features(df, sales_col, date_col, lags=[1, 7]):
-    """Creates lagged features for a single group DataFrame."""
-    df_lagged = df.copy()
-    df_lagged = df_lagged.sort_values(by=date_col) # Ensure sorted by date
-
-    for lag in lags:
-        df_lagged[f'{sales_col}_Lag_{lag}'] = df_lagged[sales_col].shift(lag)
-
-    # Handle NaNs created by lagging - fill with a strategy suitable for your data
-    # Using mean of the respective lag column as a slightly better approach than 0 if data allows
-    for lag in lags:
-        lag_col = f'{sales_col}_Lag_{lag}'
-        if df_lagged[lag_col].isnull().any():
-             mean_val = df_lagged[lag_col].mean()
-             df_lagged[lag_col].fillna(mean_val if not np.isnan(mean_val) else 0, inplace=True)
-
-
-    return df_lagged
-
-
-# --- Function to Process a Single Group (for Parallel Execution) ---
-def train_and_forecast_group(group_id, group_df_json, config):
+def create_nn_model(input_shape, units=64, dropout_rate=0.2):
     """
-    Trains models for a single group and returns results.
-    Designed to be run in a separate process. Includes error handling.
+    Create a simple neural network model for time series forecasting.
+
+    Args:
+        input_shape: Shape of input data
+        units: Number of neurons in hidden layers
+        dropout_rate: Dropout rate for regularization
+
+    Returns:
+        model: Compiled neural network model
     """
-    group_forecasts = {}
-    metrics = {'group_id': group_id}
-    test_data_json = None
-    error_message = None
-    residual_data = {}
-    lstm_history = None
-    nn_history = None
+    model = Sequential()
+    model.add(InputLayer(input_shape=input_shape))
+    model.add(Flatten())
+    model.add(Dense(units, activation='relu'))
+    model.add(Dropout(dropout_rate))
+    model.add(Dense(units // 2, activation='relu'))
+    model.add(Dropout(dropout_rate))
+    model.add(Dense(1))
+
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    return model
 
 
-    try:
-        # Reconstruct DataFrame from JSON string
-        group_df = pd.read_json(group_df_json, orient='split')
-        group_df[config['date_column']] = pd.to_datetime(group_df[config['date_column']])
-        # Keep the date column for feature engineering before setting index
-        # group_df.set_index(config['date_column'], inplace=True) # Set index later if needed
+def generate_rolling_forecast(model, initial_sequence, steps, scaler=None, is_lstm=True):
+    """
+    Generate a rolling forecast where each prediction is fed back
+    as input for the next prediction.
 
+    Args:
+        model: Trained model (LSTM or NN)
+        initial_sequence: Initial input sequence
+        steps: Number of steps to forecast
+        scaler: Scaler object for inverse transformation
+        is_lstm: Whether the model is LSTM (affects input reshaping)
 
-        sales_column = config['sales_column']
-        date_column = config['date_column']
-        config_time_series_frequency = config['time_series_frequency'] # Get from config
-        test_size_days = config['test_size_days']
-        lstm_look_back = config['lstm_look_back'] # Used for NN lookback too
-        lstm_epochs = config['lstm_epochs']
-        lstm_batch_size = config['lstm_batch_size']
-        use_bidirectional_lstm = config['use_bidirectional_lstm']
-        add_lagged_features = config['add_lagged_features']
-        output_dir = config['output_dir']
+    Returns:
+        forecast: Array of forecasted values
+    """
+    forecast = []
+    curr_seq = initial_sequence.copy()
 
-        # Model Inclusion Flags and Parameters
-        use_arima_model = config['use_arima_model']
-        use_ma_model = config['use_ma_model']
-        ma_q_order = config['ma_q_order']
-        use_nn_model = config['use_nn_model']
-        nn_layers = config['nn_layers']
-        nn_units = config['nn_units']
-        use_lstm_model = config['use_lstm_model']
-        use_hybrid_model = config['use_hybrid_model'] # Depends on ARIMA and LSTM
-
-
-        # --- Feature Engineering (inside process for that group) ---
-        features_to_scale = [sales_column] # Always include sales column
-        if add_lagged_features:
-             group_df = create_lagged_features(group_df, sales_column, date_column, lags=[1, 7])
-             # Add lagged feature columns to features_to_scale
-             features_to_scale.extend([col for col in group_df.columns if '_Lag_' in col])
-
-        # Add other general time-based features (Year, Month, etc.) to features_to_scale if present
-        # Assuming these were added to the main df before passing to the process
-        # Need to make sure these columns exist in the group_df and are numeric
-        general_time_features = ['Year', 'Month', 'Day', 'DayOfWeek', 'DayOfYear', 'WeekOfYear']
-        for feature in general_time_features:
-            if feature in group_df.columns and pd.api.types.is_numeric_dtype(group_df[feature]):
-                 if feature not in features_to_scale: # Avoid duplicates
-                     features_to_scale.append(feature)
-
-
-        # Set index AFTER feature engineering that might need the date column
-        group_df.set_index(date_column, inplace=True)
-        ts_data = group_df[features_to_scale] # Use ALL selected features for LSTM/NN input
-
-
-        # --- Data Split ---
-        min_data_points_arima_ma = test_size_days + 1 # ARIMA/MA only need data for split
-        min_data_points_sequence = test_size_days + lstm_look_back + 1 # LSTM/NN need lookback
-
-        min_required_points = min_data_points_arima_ma
-        if use_lstm_model or use_nn_model or use_hybrid_model:
-             min_required_points = max(min_required_points, min_data_points_sequence)
-
-
-        if len(ts_data) < min_required_points:
-             error_message = f"Insufficient data points ({len(ts_data)}) for test split ({test_size_days}) and sequence look-back ({lstm_look_back}). Required: {min_required_points}"
-             metrics.update({k: np.nan for k in ['ARIMA_RMSE', 'ARIMA_MAE', 'MA_RMSE', 'MA_MAE', 'NN_RMSE', 'NN_MAE', 'LSTM_RMSE', 'LSTM_MAE', 'Hybrid_RMSE', 'Hybrid_MAE']})
-             return group_id, None, None, metrics, error_message, None, None, None # Return error message and None for residuals/histories
-
-
-        train_data = ts_data[:-test_size_days]
-        test_data = ts_data[-test_size_days:]
-
-        # Convert test_data index to a common format before JSON conversion
-        test_data_reset = test_data.reset_index()
-        test_data_reset[date_column] = test_data_reset[date_column].astype(str) # Convert date to string for JSON
-        test_data_json = test_data_reset.to_json(orient='split')
-
-
-        # Determine ARIMA/MA seasonality (m) based on frequency
-        # pmdarima uses integer for 'm'. Common frequencies:
-        # D=1 (no seasonality), W=7, M=12, Q=4, Y=1. A value of 7 is often used for daily data assuming weekly seasonality.
-        arima_ma_m = 1 # Default to non-seasonal if frequency is not standard or detectable
-
-        # If user provided frequency, use that first
-        if config_time_series_frequency:
-            try:
-                 user_freq_offset = pd.tseries.frequencies.to_offset(config_time_series_frequency)
-                 if user_freq_offset:
-                    st_user = user_freq_offset.freqstr
-                    if st_user == 'D': arima_ma_m = 7 # Assuming weekly seasonality for Daily data
-                    elif st_user == 'W': arima_ma_m = 52 # Assuming yearly seasonality for Weekly data
-                    elif st_user == 'M': arima_ma_m = 12
-                    elif st_user == 'Q' or st_user == 'QS' : arima_ma_m = 4
-                    elif st_user == 'Y' or st_user == 'YS': arima_ma_m = 1
-                    # print(f"Using user-specified frequency '{config_time_series_frequency}' (m={arima_ma_m}) for group {group_id}")
-            except Exception as e:
-                 error_message = (error_message + "\n" if error_message else "") + f"Frequency Conversion Error: {e}. Attempting auto-inference."
-                 arima_ma_m = 1 # Fallback if user input is invalid
-
-
-        # If no valid user frequency or user left it empty, attempt to infer
-        if arima_ma_m == 1 and not config_time_series_frequency:
-            try:
-                inferred_freq = pd.infer_freq(train_data.index)
-                if inferred_freq:
-                     st_inf = pd.tseries.frequencies.to_offset(inferred_freq).freqstr # Convert to freq string
-                     if st_inf == 'D': arima_ma_m = 7 # Assuming weekly seasonality for Daily data
-                     elif st_inf == 'W': arima_ma_m = 52 # Assuming yearly seasonality for Weekly data
-                     elif st_inf == 'M': arima_ma_m = 12
-                     elif st_inf == 'Q' or st_inf == 'QS' : arima_ma_m = 4
-                     elif st_inf == 'Y' or st_inf == 'YS': arima_ma_m = 1
-                     # print(f"Using inferred frequency '{inferred_freq}' (m={arima_ma_m}) for group {group_id}")
-                # else:
-                   # print(f"Could not infer frequency for group {group_id}. Using m=1.")
-
-            except Exception as e:
-                 # print(f"Error inferring frequency for group {group_id}: {e}. Using m=1.")
-                 arima_ma_m = 1 # Fallback to non-seasonal
-
-        # print(f"Final ARIMA/MA seasonality (m) for group {group_id}: {arima_ma_m}")
-
-
-        # --- Model 1: ARIMA ---
-        arima_model = None
-        arima_forecast = None
-        arima_residuals_test = None
-        if use_arima_model:
-            try:
-                # Fine-tuned auto_arima parameters for potentially faster search and using determined 'm'
-                arima_model = auto_arima(train_data[sales_column],
-                                         start_p=1, start_q=1,
-                                         test='adf',
-                                         max_p=2, max_q=2, # Reduced max p, q
-                                         m=arima_ma_m,    # Use determined seasonality
-                                         start_P=0, start_Q=0,
-                                         max_P=1, max_Q=1, # Reduced max P, Q
-                                         seasonal=True, d=None, D=None, trace=False,
-                                         error_action='ignore', suppress_warnings=True, stepwise=True)
-
-                arima_forecast = arima_model.predict(n_periods=len(test_data))
-                group_forecasts['ARIMA'] = arima_forecast.values.tolist()
-
-                arima_residuals_test = test_data[sales_column].values - arima_forecast.values
-                residual_data['ARIMA'] = arima_residuals_test.tolist()
-
-                arima_rmse = np.sqrt(np.mean(arima_residuals_test**2))
-                arima_mae = np.mean(np.abs(arima_residuals_test))
-                metrics['ARIMA_RMSE'] = arima_rmse
-                metrics['ARIMA_MAE'] = arima_mae
-                # print(f"  ARIMA Forecast generated for {group_id}. RMSE: {arima_rmse:.4f}, MAE: {arima_mae:.4f}")
-            except Exception as e:
-                error_message = (error_message + "\n" if error_message else "") + f"ARIMA Error: {e}"
-                # print(f"  Error training/forecasting ARIMA for group {group_id}: {e}")
-                metrics['ARIMA_RMSE'] = np.nan
-                metrics['ARIMA_MAE'] = np.nan
-                group_forecasts['ARIMA'] = None
-                residual_data['ARIMA'] = None # No residuals if error
+    for _ in range(steps):
+        # Reshape for prediction
+        if is_lstm:
+            input_seq = curr_seq.reshape(1, curr_seq.shape[0], curr_seq.shape[1])
         else:
-             metrics['ARIMA_RMSE'] = np.nan # Mark as NaN if model not selected
-             metrics['ARIMA_MAE'] = np.nan
+            input_seq = curr_seq.reshape(1, -1)
 
+        # Predict next value and append to forecast
+        pred = model.predict(input_seq, verbose=0)[0]
+        forecast.append(pred[0])
 
-        # --- Model 2: MA (Moving Average) ---
-        ma_model = None
-        ma_forecast = None
-        ma_residuals_test = None
-        if use_ma_model:
-            try:
-                 # Implement MA(q) model using statsmodels ARIMA with p=0, d=0
-                 # Use the specified ma_q_order and seasonality (m)
-                 # Check if ma_q_order is valid and training data has enough points
-                 if ma_q_order <= 0:
-                      raise ValueError(f"MA order (q) must be positive, got {ma_q_order}")
-                 if len(train_data) < ma_q_order + 1: # Need at least q+1 points to estimate MA(q)
-                      raise ValueError(f"Insufficient training data points ({len(train_data)}) for MA({ma_q_order}) model. Need at least {ma_q_order + 1}.")
-
-
-                 ma_model = ARIMA(train_data[sales_column], order=(0, 0, ma_q_order),
-                                  seasonal_order=(0, 0, 0, arima_ma_m if arima_ma_m > 1 else 0)) # Only add seasonal component if m > 1
-                 ma_results = ma_model.fit()
-
-                 # Generate forecast for the test period
-                 ma_forecast = ma_results.predict(start=len(train_data), end=len(ts_data)-1)
-
-                 group_forecasts['MA'] = ma_forecast.values.tolist()
-
-                 # Calculate test residuals for MA
-                 ma_residuals_test = test_data[sales_column].values - ma_forecast.values
-                 residual_data['MA'] = ma_residuals_test.tolist()
-
-                 ma_rmse = np.sqrt(np.mean(ma_residuals_test**2))
-                 ma_mae = np.mean(np.abs(ma_residuals_test))
-                 metrics['MA_RMSE'] = ma_rmse
-                 metrics['MA_MAE'] = ma_mae
-                 # print(f"  MA Forecast generated for {group_id}. RMSE: {ma_rmse:.4f}, MAE: {ma_mae:.4f}")
-
-            except Exception as e:
-                 error_message = (error_message + "\n" if error_message else "") + f"MA Error: {e}"
-                 # print(f"  Error training/forecasting MA for group {group_id}: {e}")
-                 metrics['MA_RMSE'] = np.nan
-                 metrics['MA_MAE'] = np.nan
-                 group_forecasts['MA'] = None
-                 residual_data['MA'] = None # No residuals if error
+        # Update sequence for next prediction
+        if is_lstm:
+            curr_seq = np.roll(curr_seq, -1, axis=0)
+            curr_seq[-1] = pred
         else:
-             metrics['MA_RMSE'] = np.nan # Mark as NaN if model not selected
-             metrics['MA_MAE'] = np.nan
+            curr_seq = np.roll(curr_seq, -1)
+            curr_seq[-1] = pred
+
+    # Inverse transform if scaler is provided
+    if scaler:
+        forecast = scaler.inverse_transform(np.array(forecast).reshape(-1, 1)).flatten()
+
+    return np.array(forecast)
 
 
-        # --- Data Scaling and Sequence Creation (for NN and LSTM) ---
-        scaler = None
-        scaled_train_data = None
-        scaled_ts_data = None
-        X_train_seq = None
-        y_train_seq = None
+def evaluate_forecast(y_true, y_pred):
+    """
+    Calculate evaluation metrics for forecasts.
 
-        # Prepare sequence data only if at least one sequence model is selected
-        if use_nn_model or use_lstm_model or use_hybrid_model:
+    Args:
+        y_true: True values
+        y_pred: Predicted values
+
+    Returns:
+        metrics: Dictionary of evaluation metrics
+    """
+    metrics = {
+        'rmse': np.sqrt(mean_squared_error(y_true, y_pred)),
+        'mae': mean_absolute_error(y_true, y_pred),
+        'mape': np.mean(np.abs((y_true - y_pred) / y_true)) * 100 if not np.any(y_true == 0) else np.nan,
+        'r2': r2_score(y_true, y_pred)
+    }
+    return metrics
+
+def run_all_forecasts(df_processed, current_app_config, models_to_run):
+    """
+    Run all selected forecasting models and store results.
+
+    Args:
+        df_processed: Processed DataFrame
+        current_app_config: Dictionary of app configuration
+        models_to_run: List of models to run
+
+    Returns:
+        None (stores results in session state)
+    """
+    st.info(f"Starting forecasting process for models: {', '.join(models_to_run)}...")
+
+    metrics_list = []
+    forecast_dfs_list = []
+    residual_plots_data = {}
+    lstm_histories = {}
+    nn_histories = {}
+    arima_pi_data = {}
+
+    date_col = current_app_config['date_column']
+    target_col = current_app_config['target_column']
+    group_col = current_app_config['group_column']
+    forecast_horizon = current_app_config['forecast_horizon']
+    test_size_percentage = current_app_config['test_size_percentage'] / 100.0  # Convert to fraction
+
+    # Configure neural network parameters
+    lookback_window = current_app_config.get('lookback_window', 12)  # Default to 12 time steps
+    nn_epochs = current_app_config.get('nn_epochs', 50)
+    nn_batch_size = current_app_config.get('nn_batch_size', 32)
+
+    # Determine groups for iteration
+    groups = [None]  # For non-grouped data (overall)
+    if group_col and group_col in df_processed.columns:
+        groups = df_processed[group_col].unique()
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, group_id in enumerate(groups):
+        group_id_str = group_id if group_id is not None else 'Overall'
+        status_text.text(f"Processing group {i+1}/{len(groups)}: {group_id_str}")
+        progress_bar.progress((i + 1) / len(groups))
+
+        # Filter data for current group
+        group_df = df_processed.copy()
+        if group_id is not None:
+            group_df = df_processed[df_processed[group_col] == group_id].copy()
+
+        group_metrics = {'group_id': group_id_str}
+
+        # Sort by date and set index for time series analysis
+        group_df = group_df.sort_values(by=date_col).set_index(date_col)
+        series = group_df[target_col]
+
+        # Check if we have enough data
+        min_required_points = forecast_horizon + lookback_window + 1
+        if len(series) < min_required_points:
+            st.warning(f"Skipping group '{group_id_str}': insufficient data ({len(series)} points, need {min_required_points})")
+            metrics_list.append(group_metrics)
+            continue
+
+        # Calculate test size in actual points
+        test_size_points = max(int(len(series) * test_size_percentage), forecast_horizon)
+        test_size_points = min(test_size_points, len(series) - lookback_window - 1)
+
+        # Split into train and test sets
+        train_series = series[:-test_size_points]
+        test_series = series[-test_size_points:]
+
+        # Create forecast DataFrame
+        group_forecast_df = pd.DataFrame(index=test_series.index)
+        group_forecast_df['Actual'] = test_series
+
+        # Add group column if applicable
+        if group_col:
+            group_forecast_df[group_col] = group_id
+
+        # ======================= ARIMA FORECASTING =======================
+        if "ARIMA" in models_to_run:
             try:
-                 scaler = StandardScaler()
-                 # Scale all selected features using only training data for fitting
-                 scaled_train_data = scaler.fit_transform(train_data)
-                 scaled_ts_data = scaler.transform(ts_data) # Transform entire time series
+                status_text.text(f"Running ARIMA for group: {group_id_str}")
 
-                 # Create sequence dataset for NN/LSTM
-                 if len(scaled_train_data) <= lstm_look_back:
-                      raise ValueError(f"Not enough training data points ({len(scaled_train_data)}) for the specified look_back period ({lstm_look_back}).")
+                # Auto ARIMA to find optimal parameters
+                auto_model = auto_arima(
+                    train_series,
+                    seasonal=True,
+                    m=12,  # Monthly seasonality by default
+                    stepwise=True,
+                    suppress_warnings=True,
+                    error_action='ignore',
+                    trace=False,
+                    max_order=10,
+                    max_d=2,
+                    max_p=5,
+                    max_q=5
+                )
 
-                 X_train_seq, y_train_seq = create_sequence_dataset(scaled_train_data, lstm_look_back)
+                # Get the best order and seasonal order
+                order = auto_model.order
+                seasonal_order = auto_model.seasonal_order
 
-                 if X_train_seq.shape[0] == 0:
-                      raise ValueError("Sequence dataset creation resulted in zero training samples.")
+                # Fit ARIMA model with the best parameters
+                arima_model = ARIMA(
+                    train_series,
+                    order=order,
+                    seasonal_order=seasonal_order
+                )
+                arima_results = arima_model.fit()
 
-                 # Reshape X_train_seq for Keras input (n_samples, look_back, n_features)
-                 # NN will flatten this later, LSTM expects this shape
-                 X_train_seq = np.reshape(X_train_seq, (X_train_seq.shape[0], lstm_look_back, len(features_to_scale)))
+                # Generate forecasts
+                arima_forecast = arima_results.forecast(steps=len(test_series))
+                group_forecast_df['ARIMA_Forecast'] = arima_forecast
 
+                # Calculate prediction intervals
+                pred_interval = arima_results.get_forecast(steps=len(test_series)).conf_int()
+                lower_bound = pred_interval.iloc[:, 0]
+                upper_bound = pred_interval.iloc[:, 1]
 
-                 # Save scaler - only save if sequence data prep was successful
-                 group_model_dir = os.path.join(output_dir, f"group_models_{group_id}")
-                 os.makedirs(group_model_dir, exist_ok=True)
-                 scaler_filename = os.path.join(group_model_dir, f'scaler_group_{group_id}.joblib')
-                 joblib.dump(scaler, scaler_filename)
+                # Store prediction intervals
+                group_forecast_df['ARIMA_Lower'] = lower_bound.values
+                group_forecast_df['ARIMA_Upper'] = upper_bound.values
 
+                # Store for later use
+                arima_pi_data[group_id_str] = {
+                    'lower': lower_bound.values,
+                    'upper': upper_bound.values
+                }
+
+                # Calculate metrics
+                arima_metrics = evaluate_forecast(test_series.values, arima_forecast)
+                for metric_name, metric_value in arima_metrics.items():
+                    group_metrics[f'ARIMA_{metric_name.upper()}'] = metric_value
+
+                # Store residuals for plotting
+                residual_plots_data[f"{group_id_str}_ARIMA"] = {
+                    'residuals': test_series.values - arima_forecast,
+                    'fitted': arima_forecast
+                }
 
             except Exception as e:
-                 error_message = (error_message + "\n" if error_message else "") + f"Scaling/Sequence Data Prep Error: {e}"
-                 # print(f"  Error during scaling or sequence data preparation for group {group_id}: {e}")
-                 # Ensure related models are marked as failed
-                 if use_nn_model: metrics['NN_RMSE'] = np.nan; metrics['NN_MAE'] = np.nan; group_forecasts['NN'] = None; residual_data['NN'] = None; nn_history = None
-                 if use_lstm_model: metrics['LSTM_RMSE'] = np.nan; metrics['LSTM_MAE'] = np.nan; group_forecasts['LSTM'] = None; residual_data['LSTM'] = None; lstm_history = None
-                 if use_hybrid_model: metrics['Hybrid_RMSE'] = np.nan; metrics['Hybrid_MAE'] = np.nan; group_forecasts['Hybrid'] = None; residual_data['Hybrid'] = None
-                 # Ensure training is skipped
-                 X_train_seq = None
-                 scaled_ts_data = None # Ensure test data is also marked as unavailable for sequence models
+                st.warning(f"ARIMA failed for group {group_id_str}: {str(e)}")
+                group_metrics['ARIMA_RMSE'] = np.nan
+                group_metrics['ARIMA_MAE'] = np.nan
 
-
-        # --- Model 3: NN (Neural Network) ---
-        nn_model = None
-        nn_forecast = None
-        nn_residuals_test = None
-        nn_history = None # Renamed to avoid conflict with lstm_history
-        if use_nn_model and X_train_seq is not None: # Only train if data prep was successful
+        # ======================= DATA PREPARATION FOR NN/LSTM =======================
+        if "LSTM" in models_to_run or "Simple NN" in models_to_run:
             try:
-                # Use a subdirectory for each group's models
-                group_model_dir = os.path.join(output_dir, f"group_models_{group_id}")
-                os.makedirs(group_model_dir, exist_ok=True)
-                nn_checkpoint_path = os.path.join(group_model_dir, f"nn_model_group_{group_id}.keras")
+                # Scale the data
+                scaler = MinMaxScaler(feature_range=(0, 1))
+                series_values = series.values.reshape(-1, 1)
+                scaled_data = scaler.fit_transform(series_values)
 
-                # --- Check for and load existing model checkpoint ---
-                if os.path.exists(nn_checkpoint_path):
-                    try:
-                        nn_model = load_model(nn_checkpoint_path)
-                        # print(f"  Loaded existing NN model for group {group_id} from checkpoint.")
-                        loaded_from_checkpoint = True
-                    except Exception as load_e:
-                        # print(f"  Error loading existing NN model for group {group_id}: {load_e}. Building new model.")
-                        nn_model = build_nn_model(lstm_look_back, features=len(features_to_scale), num_layers=nn_layers, units=nn_units)
-                        loaded_from_checkpoint = False
-                else:
-                    # print(f"  No existing NN checkpoint found for group {group_id}. Building new model.")
-                    nn_model = build_nn_model(lstm_look_back, features=len(features_to_scale), num_layers=nn_layers, units=nn_units)
-                    loaded_from_checkpoint = False
-                # --- End of checkpoint loading ---
+                # Split scaled data
+                train_data = scaled_data[:-test_size_points]
+                test_data = scaled_data[-test_size_points:]
 
+                # Create sequences
+                X_train, y_train = create_sequences(train_data, lookback_window, 1)
+                X_test, y_test = create_sequences(test_data, lookback_window, 1)
 
-                nn_callbacks = [
-                    EarlyStopping(monitor='loss', patience=10, verbose=0, restore_best_weights=True),
-                    ModelCheckpoint(filepath=nn_checkpoint_path, monitor='loss', save_best_only=True, verbose=0, save_weights_only=False),
-                    ReduceLROnPlateau(monitor='loss', factor=0.1, patience=5, verbose=0)
-                ]
-
-                # Train NN model
-                history_nn = nn_model.fit(X_train_seq, y_train_seq, epochs=lstm_epochs, batch_size=lstm_batch_size,
-                                          verbose=0, callbacks=nn_callbacks, shuffle=False) # Shuffle=False important for time series
-                nn_history = history_nn.history['loss'] # Collect loss history
-
-                # Ensure best model is loaded after training if checkpoint was used
-                if os.path.exists(nn_checkpoint_path):
-                    try:
-                        nn_model = load_model(nn_checkpoint_path)
-                        # print(f"  Loaded best NN model after training for group {group_id}.")
-                    except Exception as load_e:
-                        # print(f"  Error loading best NN model after training for group {group_id}: {load_e}.")
-                        pass # Continue with the model object from fit if loading fails
-
-
-                # Prepare test data for NN prediction (rolling forecast)
-                # Similar to LSTM, need the last `look_back` points of scaled data
-                if scaled_ts_data is None or len(scaled_ts_data) < len(test_data) + lstm_look_back:
-                     raise ValueError("Insufficient scaled test data for NN rolling forecast.")
-
-                nn_input_sequence_scaled = scaled_ts_data[-(len(test_data) + lstm_look_back):]
-
-                nn_forecast_scaled_list = []
-                current_input_window_nn = nn_input_sequence_scaled[:lstm_look_back] # Shape (look_back, n_features)
-
-                for i in range(len(test_data)):
-                     # Reshape for prediction (1, look_back, n_features)
-                     input_for_pred_nn = np.reshape(current_input_window_nn, (1, lstm_look_back, len(features_to_scale)))
-                     pred_scaled_nn = nn_model.predict(input_for_pred_nn, verbose=0)[0, 0] # Predict the next sales value
-                     nn_forecast_scaled_list.append(pred_scaled_nn)
-
-                     # Prepare input for the next step: roll and update sales position
-                     next_input_window_nn = np.roll(current_input_window_nn, -1, axis=0)
-                     next_input_window_nn[-1, features_to_scale.index(sales_column)] = pred_scaled_nn
-
-                     current_input_window_nn = next_input_window_nn
-
-
-                nn_forecast_scaled = np.array(nn_forecast_scaled_list).reshape(-1, 1)
-                # Inverse transform
-                temp_scaled_array_nn = np.zeros((nn_forecast_scaled.shape[0], len(features_to_scale)))
-                temp_scaled_array_nn[:, features_to_scale.index(sales_column)] = nn_forecast_scaled.flatten()
-                # Use the main scaler for inverse transform
-                nn_forecast = scaler.inverse_transform(temp_scaled_array_nn)[:, features_to_scale.index(sales_column)].flatten()
-
-
-                group_forecasts['NN'] = nn_forecast.tolist() # Convert to list
-
-                # Calculate test residuals for NN
-                nn_residuals_test = test_data[sales_column].values - nn_forecast
-                residual_data['NN'] = nn_residuals_test.tolist()
-
-                nn_rmse = np.sqrt(np.mean(nn_residuals_test**2))
-                nn_mae = np.mean(np.abs(nn_residuals_test))
-                metrics['NN_RMSE'] = nn_rmse
-                metrics['NN_MAE'] = nn_mae
-                # print(f"  NN Forecast generated for {group_id}. RMSE: {nn_rmse:.4f}, MAE: {nn_mae:.4f}")
+                # Ensure we have enough sequences
+                if len(X_train) == 0 or len(X_test) == 0:
+                    raise ValueError(f"Not enough data to create sequences with lookback {lookback_window}")
 
             except Exception as e:
-                error_message = (error_message + "\n" if error_message else "") + f"NN Error: {e}"
-                # print(f"  Error training/forecasting NN for group {group_id}: {e}")
-                metrics['NN_RMSE'] = np.nan
-                metrics['NN_MAE'] = np.nan
-                group_forecasts['NN'] = None
-                residual_data['NN'] = None
-                nn_history = None
-        else:
-             metrics['NN_RMSE'] = np.nan # Mark as NaN if model not selected or data prep failed
-             metrics['NN_MAE'] = np.nan
+                st.error(f"NN/LSTM data preparation failed for group {group_id_str}: {str(e)}")
+                X_train = np.array([])
+                y_train = np.array([])
+                X_test = np.array([])
+                y_test = np.array([])
 
-
-        # --- Model 4: LSTM ---
-        lstm_model = None
-        lstm_forecast = None
-        lstm_residuals_test = None
-        group_lstm_history = None
-        if use_lstm_model and X_train_seq is not None: # Only train if data prep was successful
+        # ======================= LSTM FORECASTING =======================
+        if "LSTM" in models_to_run and len(X_train) > 0:
             try:
-                # Use a subdirectory for each group's models
-                group_model_dir = os.path.join(output_dir, f"group_models_{group_id}")
-                os.makedirs(group_model_dir, exist_ok=True)
-                # Keras checkpoint path
-                checkpoint_path = os.path.join(group_model_dir, f"lstm_model_group_{group_id}.keras")
+                status_text.text(f"Running LSTM for group: {group_id_str}")
 
-                # --- Check for and load existing model checkpoint ---
-                if os.path.exists(checkpoint_path):
-                    try:
-                        lstm_model = load_model(checkpoint_path)
-                        # print(f"  Loaded existing LSTM model for group {group_id} from checkpoint.")
-                        loaded_from_checkpoint = True
-                    except Exception as load_e:
-                        # print(f"  Error loading existing LSTM model for group {group_id}: {load_e}. Building new model.")
-                        lstm_model = build_lstm_model(lstm_look_back, features=len(features_to_scale), bidirectional=use_bidirectional_lstm)
-                        loaded_from_checkpoint = False
-                else:
-                    # print(f"  No existing LSTM checkpoint found for group {group_id}. Building new model.")
-                    lstm_model = build_lstm_model(lstm_look_back, features=len(features_to_scale), bidirectional=use_bidirectional_lstm)
-                    loaded_from_checkpoint = False
-                # --- End of checkpoint loading ---
+                # Create LSTM model
+                lstm_model = create_lstm_model(
+                    input_shape=(X_train.shape[1], X_train.shape[2]),
+                    lstm_units=64,
+                    dropout_rate=0.2,
+                    bidirectional=True
+                )
 
-
+                # Callbacks for training
                 callbacks = [
-                    EarlyStopping(monitor='loss', patience=10, verbose=0, restore_best_weights=True),
-                    ModelCheckpoint(filepath=checkpoint_path, monitor='loss', save_best_only=True, verbose=0, save_weights_only=False),
-                    ReduceLROnPlateau(monitor='loss', factor=0.1, patience=5, verbose=0)
+                    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+                    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=0.0001)
                 ]
 
-                # Train LSTM model (relying on Early Stopping)
-                history = lstm_model.fit(X_train_seq, y_train_seq, epochs=lstm_epochs, batch_size=lstm_batch_size,
-                                        verbose=0, callbacks=callbacks, shuffle=False)
-                group_lstm_history = history.history['loss'] # Collect loss history
+                # Train model
+                lstm_history = lstm_model.fit(
+                    X_train, y_train,
+                    epochs=nn_epochs,
+                    batch_size=nn_batch_size,
+                    validation_split=0.2,
+                    callbacks=callbacks,
+                    verbose=0
+                )
 
+                # Store training history
+                lstm_histories[group_id_str] = lstm_history
 
-                # Ensure best model is loaded after training if checkpoint was used
-                if os.path.exists(checkpoint_path):
-                    try:
-                         lstm_model = load_model(checkpoint_path)
-                         # print(f"  Loaded best LSTM model after training for group {group_id}.")
-                    except Exception as load_e:
-                         # print(f"  Error loading best LSTM model after training for group {group_id}: {load_e}.")
-                         pass # Continue with the model object from fit if loading fails
+                # Generate rolling forecast
+                initial_sequence = scaled_data[-test_size_points-lookback_window:-test_size_points]
 
+                lstm_forecast = []
+                last_sequence = initial_sequence.copy()
 
-                # Prepare test data for LSTM prediction (rolling forecast)
-                # Need the last `lstm_look_back` points of the scaled data (all features)
-                # from the END OF TRAINING to start the forecasting sequence.
-                if scaled_ts_data is None or len(scaled_ts_data) < len(test_data) + lstm_look_back:
-                     raise ValueError("Insufficient scaled test data for LSTM rolling forecast.")
+                for step in range(len(test_series)):
+                    # Reshape sequence for prediction
+                    current_seq = last_sequence.reshape(1, lookback_window, 1)
+                    # Predict next value
+                    next_pred = lstm_model.predict(current_seq, verbose=0)[0, 0]
+                    # Add to forecast
+                    lstm_forecast.append(next_pred)
+                    # Update sequence for next prediction
+                    last_sequence = np.append(last_sequence[1:], next_pred).reshape(-1, 1)
 
-                lstm_input_sequence_scaled = scaled_ts_data[-(len(test_data) + lstm_look_back):]
+                # Inverse scale forecasts
+                lstm_forecast = scaler.inverse_transform(np.array(lstm_forecast).reshape(-1, 1)).flatten()
 
-                lstm_forecast_scaled_list = []
-                # Get the initial input window from the end of the combined scaled data
-                current_input_window_lstm = lstm_input_sequence_scaled[:lstm_look_back] # Shape (look_back, n_features)
+                # Add to forecast DataFrame
+                group_forecast_df['LSTM_Forecast'] = lstm_forecast
 
+                # Calculate metrics
+                lstm_metrics = evaluate_forecast(test_series.values, lstm_forecast)
+                for metric_name, metric_value in lstm_metrics.items():
+                    group_metrics[f'LSTM_{metric_name.upper()}'] = metric_value
 
-                for i in range(len(test_data)):
-                    # Reshape for prediction (1, look_back, n_features)
-                    input_for_pred = np.reshape(current_input_window_lstm, (1, lstm_look_back, len(features_to_scale)))
-                    pred_scaled = lstm_model.predict(input_for_pred, verbose=0)[0, 0] # Predict the next sales value (the first feature)
-                    lstm_forecast_scaled_list.append(pred_scaled)
-
-                    # Prepare input for the next step: roll the sequence and add the predicted value
-                    next_input_window_lstm = np.roll(current_input_window_lstm, -1, axis=0) # Roll along the time dimension
-                    # Replace the last step's sales feature with the prediction
-                    next_input_window_lstm[-1, features_to_scale.index(sales_column)] = pred_scaled
-
-                    # Similar limitations for recursive forecasting with features apply here
-
-                    current_input_window_lstm = next_input_window_lstm # Update input for the next step
-
-
-                lstm_forecast_scaled = np.array(lstm_forecast_scaled_list).reshape(-1, 1)
-                # Inverse transform
-                temp_scaled_array_lstm = np.zeros((lstm_forecast_scaled.shape[0], len(features_to_scale)))
-                temp_scaled_array_lstm[:, features_to_scale.index(sales_column)] = lstm_forecast_scaled.flatten()
-
-                # Use the main scaler for inverse transform
-                lstm_forecast = scaler.inverse_transform(temp_scaled_array_lstm)[:, features_to_scale.index(sales_column)].flatten()
-
-
-                group_forecasts['LSTM'] = lstm_forecast.tolist() # Convert to list
-
-                # Calculate test residuals for LSTM
-                lstm_residuals_test = test_data[sales_column].values - lstm_forecast
-                residual_data['LSTM'] = lstm_residuals_test.tolist()
-
-                lstm_rmse = np.sqrt(np.mean(lstm_residuals_test**2))
-                lstm_mae = np.mean(np.abs(lstm_residuals_test))
-                metrics['LSTM_RMSE'] = lstm_rmse
-                metrics['LSTM_MAE'] = lstm_mae
-                # print(f"  LSTM Forecast generated for {group_id}. RMSE: {lstm_rmse:.4f}, MAE: {lstm_mae:.4f}")
+                # Store residuals for plotting
+                residual_plots_data[f"{group_id_str}_LSTM"] = {
+                    'residuals': test_series.values - lstm_forecast,
+                    'fitted': lstm_forecast
+                }
 
             except Exception as e:
-                error_message = (error_message + "\n" if error_message else "") + f"LSTM Error: {e}"
-                # print(f"  Error training/forecasting LSTM for group {group_id}: {e}")
-                metrics['LSTM_RMSE'] = np.nan
-                metrics['LSTM_MAE'] = np.nan
-                group_forecasts['LSTM'] = None
-                residual_data['LSTM'] = None
-                group_lstm_history = None
-        else:
-             metrics['LSTM_RMSE'] = np.nan # Mark as NaN if model not selected or data prep failed
-             metrics['LSTM_MAE'] = np.nan
+                st.warning(f"LSTM failed for group {group_id_str}: {str(e)}")
+                group_metrics['LSTM_RMSE'] = np.nan
+                group_metrics['LSTM_MAE'] = np.nan
 
-        # --- Model 5: Hybrid ARIMA-LSTM ---
-        hybrid_lstm_model = None
-        hybrid_scaler = None
-        hybrid_forecast = None
-        hybrid_residuals_test = None
-        # Hybrid history is for residual model, could store if needed but maybe less critical than main LSTM
-        # group_hybrid_lstm_history = None
-        if use_hybrid_model and use_arima_model and use_lstm_model: # Only train if Hybrid, ARIMA, and LSTM are selected
+        # ======================= SIMPLE NN FORECASTING =======================
+        if "Simple NN" in models_to_run and len(X_train) > 0:
             try:
-                # Check if ARIMA was successful AND produced test residuals
-                if arima_model is not None and group_forecasts.get('ARIMA') is not None and residual_data.get('ARIMA') is not None:
+                status_text.text(f"Running Simple NN for group: {group_id_str}")
 
-                    # Need the ARIMA *training* predictions to calculate training residuals
-                    # ARIMA model object should ideally have a method for in-sample prediction.
-                    # If not directly available, a common workaround is to refit on the training data
-                    # and predict over the training period, or use the stored model object if available.
-                    # Assuming arima_model object is available and fitted on train_data
+                # Reshape data for simple NN (flatten sequences)
+                X_train_nn = X_train.reshape(X_train.shape[0], -1)
+                X_test_nn = X_test.reshape(X_test.shape[0], -1)
 
-                    # Generate in-sample predictions from the fitted ARIMA model on the training data
-                    # Check if arima_model exists and is fitted
-                    if arima_model and hasattr(arima_model, 'predict_in_sample'):
-                        arima_train_pred = arima_model.predict_in_sample()
+                # Create Simple NN model
+                nn_model = create_nn_model(
+                    input_shape=(X_train_nn.shape[1],),
+                    units=64,
+                    dropout_rate=0.2
+                )
 
-                        # Align residuals with train_data
-                        # The length of predict_in_sample output can be less than train_data due to differencing.
-                        # Need to align the residuals correctly.
-                        start_index_residual = len(train_data) - len(arima_train_pred)
-                        if start_index_residual < 0: # Should not be negative for in-sample
-                            start_index_residual = 0
-                        residuals_train = train_data[sales_column].iloc[start_index_residual:] - arima_train_pred
+                # Callbacks for training
+                callbacks = [
+                    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+                    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=0.0001)
+                ]
 
+                # Train model
+                nn_history = nn_model.fit(
+                    X_train_nn, y_train,
+                    epochs=nn_epochs,
+                    batch_size=nn_batch_size,
+                    validation_split=0.2,
+                    callbacks=callbacks,
+                    verbose=0
+                )
 
-                        hybrid_scaler = StandardScaler()
-                        # Reshape for scaler fit_transform
-                        scaled_residuals_train = hybrid_scaler.fit_transform(residuals_train.values.reshape(-1, 1))
+                # Store training history
+                nn_histories[group_id_str] = nn_history
 
-                        # Create dataset for LSTM on residuals
-                        # Check if scaled_residuals_train has enough data points for the look_back period
-                        if len(scaled_residuals_train) <= lstm_look_back:
-                             raise ValueError(f"Not enough ARIMA residuals ({len(scaled_residuals_train)}) for the specified LSTM look_back period ({lstm_look_back}) for Hybrid model. Need at least {lstm_look_back + 1}.")
+                # Generate rolling forecast
+                initial_sequence = scaled_data[-test_size_points-lookback_window:-test_size_points]
 
-                        X_hybrid_train, y_hybrid_train = create_sequence_dataset(scaled_residuals_train, lstm_look_back)
+                nn_forecast = []
+                last_sequence = initial_sequence.copy()
 
-                        if X_hybrid_train.shape[0] > 0:
-                             # print(f"  Training LSTM on ARIMA residuals for {group_id}...")
-                             # LSTM on residuals always has 1 feature
-                             # Use a subdirectory for each group's models
-                             group_model_dir = os.path.join(output_dir, f"group_models_{group_id}")
-                             os.makedirs(group_model_dir, exist_ok=True) # Ensure directory exists
-                             hybrid_checkpoint_path = os.path.join(group_model_dir, f"hybrid_lstm_model_group_{group_id}.keras")
+                for step in range(len(test_series)):
+                    # Flatten sequence for prediction
+                    current_seq = last_sequence.reshape(1, -1)
+                    # Predict next value
+                    next_pred = nn_model.predict(current_seq, verbose=0)[0, 0]
+                    # Add to forecast
+                    nn_forecast.append(next_pred)
+                    # Update sequence for next prediction
+                    last_sequence = np.append(last_sequence[1:], next_pred).reshape(-1, 1)
 
-                             # --- Check for and load existing hybrid model checkpoint ---
-                             if os.path.exists(hybrid_checkpoint_path):
-                                 try:
-                                     hybrid_lstm_model = load_model(hybrid_checkpoint_path)
-                                     # print(f"  Loaded existing Hybrid LSTM model for group {group_id} from checkpoint.")
-                                     loaded_from_checkpoint = True
-                                 except Exception as load_e:
-                                     # print(f"  Error loading existing Hybrid LSTM model for group {group_id}: {load_e}. Building new model.")
-                                     hybrid_lstm_model = build_lstm_model(lstm_look_back, features=1, bidirectional=use_bidirectional_lstm)
-                                     loaded_from_checkpoint = False
-                             else:
-                                 # print(f"  No existing Hybrid LSTM checkpoint found for group {group_id}. Building new model.")
-                                 hybrid_lstm_model = build_lstm_model(lstm_look_back, features=1, bidirectional=use_bidirectional_lstm)
-                                 loaded_from_checkpoint = False
-                             # --- End of checkpoint loading ---
+                # Inverse scale forecasts
+                nn_forecast = scaler.inverse_transform(np.array(nn_forecast).reshape(-1, 1)).flatten()
 
+                # Add to forecast DataFrame
+                group_forecast_df['NN_Forecast'] = nn_forecast
 
-                             hybrid_callbacks = [
-                                 EarlyStopping(monitor='loss', patience=10, verbose=0, restore_best_weights=True),
-                                 ModelCheckpoint(filepath=hybrid_checkpoint_path, monitor='loss', save_best_only=True, verbose=0, save_weights_only=False),
-                                 ReduceLROnPlateau(monitor='loss', factor=0.1, patience=5, verbose=0)
-                             ]
+                # Calculate metrics
+                nn_metrics = evaluate_forecast(test_series.values, nn_forecast)
+                for metric_name, metric_value in nn_metrics.items():
+                    group_metrics[f'NN_{metric_name.upper()}'] = metric_value
 
-                             # Train Hybrid LSTM model (relying on Early Stopping)
-                             hybrid_history = hybrid_lstm_model.fit(X_hybrid_train, y_hybrid_train, epochs=lstm_epochs, batch_size=lstm_batch_size,
-                                                                    verbose=0, callbacks=hybrid_callbacks, shuffle=False)
-                             # Hybrid history is for residual model, could store if needed but maybe less critical than main LSTM
-                             # group_hybrid_lstm_history = hybrid_history.history['loss']
-
-                             # Ensure best model is loaded after training if checkpoint was used
-                             if os.path.exists(hybrid_checkpoint_path):
-                                 try:
-                                     hybrid_lstm_model = load_model(hybrid_checkpoint_path)
-                                     # print(f"  Loaded best Hybrid LSTM model after training for group {group_id}.")
-                                 except Exception as load_e:
-                                     # print(f"  Error loading best Hybrid LSTM model after training for group {group_id}: {load_e}.")
-                                     pass # Continue with the model object from fit if loading fails
-
-
-                             # Generate residual forecast using the trained residual LSTM model
-                             # Need the last `lstm_look_back` scaled residuals from the training set
-                             # Ensure there are enough residuals
-                             if len(scaled_residuals_train) < lstm_look_back:
-                                  raise ValueError("Not enough scaled ARIMA residuals to form the initial LSTM input sequence for forecasting.")
-
-                             hybrid_input_sequence = scaled_residuals_train[-lstm_look_back:].flatten()
-
-                             residual_forecast_scaled = []
-                             for _ in range(len(test_data)):
-                                 current_input = np.reshape(hybrid_input_sequence, (1, lstm_look_back, 1))
-                                 pred_scaled = hybrid_lstm_model.predict(current_input, verbose=0)[0, 0]
-                                 residual_forecast_scaled.append(pred_scaled)
-
-                                 # Update the input sequence for the next prediction (rolling forecast)
-                                 hybrid_input_sequence = np.roll(hybrid_input_sequence, -1)
-                                 hybrid_input_sequence[-1] = pred_scaled # Feed the prediction back in
-
-                             residual_forecast = hybrid_scaler.inverse_transform(np.array(residual_forecast_scaled).reshape(-1, 1)).flatten()
-
-                             # ARIMA forecast was already calculated earlier
-                             arima_test_forecast_values = np.array(group_forecasts.get('ARIMA')) # Get ARIMA forecast from results dict safely
-
-                             if arima_test_forecast_values is None or len(arima_test_forecast_values) != len(residual_forecast):
-                                 # This case should ideally not happen if ARIMA was successful, but safety check
-                                 raise ValueError(f"ARIMA forecast missing or length ({len(arima_test_forecast_values) if arima_test_forecast_values is not None else 'None'}) does not match residual forecast length ({len(residual_forecast)}) for Hybrid model.")
-
-                             hybrid_forecast = arima_test_forecast_values + residual_forecast # Combine ARIMA forecast and residual forecast
-                             group_forecasts['Hybrid'] = hybrid_forecast.tolist() # Convert to list
-
-                             # Calculate test residuals for Hybrid
-                             hybrid_residuals_test = test_data[sales_column].values - hybrid_forecast
-                             residual_data['Hybrid'] = hybrid_residuals_test.tolist()
-
-                             hybrid_rmse = np.sqrt(np.mean(hybrid_residuals_test**2))
-                             hybrid_mae = np.mean(np.abs(hybrid_residuals_test))
-                             metrics['Hybrid_RMSE'] = hybrid_rmse
-                             metrics['Hybrid_MAE'] = hybrid_mae
-                             # print(f"  Hybrid Forecast generated for {group_id}. RMSE: {hybrid_rmse:.4f}, MAE: {hybrid_mae:.4f}")
-
-                             # Save hybrid scaler
-                             hybrid_scaler_filename = os.path.join(output_dir, f'hybrid_scaler_group_{group_id}.joblib')
-                             joblib.dump(hybrid_scaler, hybrid_scaler_filename)
-
-                        else:
-                            error_message = (error_message + "\n" if error_message else "") + "Hybrid Error: Not enough residual data after creating look-back dataset for LSTM training."
-                            # print(f"  Skipping Hybrid LSTM for {group_id}: Not enough residual data after creating look-back...")
-                            metrics['Hybrid_RMSE'] = np.nan
-                            metrics['Hybrid_MAE'] = np.nan
-                            group_forecasts['Hybrid'] = None
-                            residual_data['Hybrid'] = None
-
-                    else:
-                        error_message = (error_message + "\n" if error_message else "") + "Hybrid Error: ARIMA model not available or not fitted correctly to calculate residuals."
-                        # print(f"  Skipping Hybrid for {group_id}: ARIMA model not available or not fitted.")
-                        metrics['Hybrid_RMSE'] = np.nan
-                        metrics['Hybrid_MAE'] = np.nan
-                        group_forecasts['Hybrid'] = None
-                        residual_data['Hybrid'] = None
-
-                else:
-                    error_message = (error_message + "\n" if error_message else "") + "Hybrid Error: ARIMA model did not run successfully or did not produce necessary outputs for hybrid modeling."
-                    # print(f"  Skipping Hybrid for {group_id}: ARIMA prerequisites not met.")
-                    metrics['Hybrid_RMSE'] = np.nan
-                    metrics['Hybrid_MAE'] = np.nan
-                    group_forecasts['Hybrid'] = None
-                    residual_data['Hybrid'] = None
+                # Store residuals for plotting
+                residual_plots_data[f"{group_id_str}_NN"] = {
+                    'residuals': test_series.values - nn_forecast,
+                    'fitted': nn_forecast
+                }
 
             except Exception as e:
-                error_message = (error_message + "\n" if error_message else "") + f"Hybrid ARIMA-LSTM Error: {e}"
-                # print(f"  Error training/forecasting Hybrid ARIMA-LSTM for group {group_id}: {e}")
-                metrics['Hybrid_RMSE'] = np.nan
-                metrics['Hybrid_MAE'] = np.nan
-                group_forecasts['Hybrid'] = None
-                residual_data['Hybrid'] = None
-                # group_hybrid_lstm_history = None # Ensure history is None if error
-        else:
-             metrics['Hybrid_RMSE'] = np.nan # Mark as NaN if model not selected or prerequisites not met
-             metrics['Hybrid_MAE'] = np.nan
+                st.warning(f"Simple NN failed for group {group_id_str}: {str(e)}")
+                group_metrics['NN_RMSE'] = np.nan
+                group_metrics['NN_MAE'] = np.nan
+
+        # Append results to lists
+        metrics_list.append(group_metrics)
+        forecast_dfs_list.append(group_forecast_df.reset_index())
+
+    # Combine results
+    evaluation_df = pd.DataFrame(metrics_list)
+    consolidated_forecast_df = pd.concat(forecast_dfs_list) if forecast_dfs_list else pd.DataFrame()
+
+    # Store in session state
+    st.session_state.evaluation_df = evaluation_df
+    st.session_state.consolidated_forecast_df = consolidated_forecast_df
+    st.session_state.all_residual_plots_data = residual_plots_data
+    st.session_state.all_lstm_history_data = lstm_histories
+    st.session_state.all_nn_history_data = nn_histories
+    st.session_state.all_arima_pi_data = arima_pi_data
+    st.session_state.forecast_results_ready = True
+
+    # Clear progress indicators
+    status_text.empty()
+    progress_bar.empty()
+
+    st.success("Forecasting completed successfully!")
 
 
-        # --- Return Results ---
-        return group_id, group_forecasts, test_data_json, metrics, error_message, residual_data, group_lstm_history, nn_history # Include NN history
-
-
-    except Exception as e:
-        # Catch any unexpected errors during the group processing
-        tb_str = traceback.format_exc() # Get detailed traceback
-        error_message = (error_message + "\n" if error_message else "") + f"Unexpected Error in Group Process {group_id}: {e}\n{tb_str}"
-        # print(f"  FATAL Error processing group {group_id}: {e}\n{tb_str}")
-        # Ensure metrics reflect the failure
-        metrics.update({k: np.nan for k in ['ARIMA_RMSE', 'ARIMA_MAE', 'MA_RMSE', 'MA_MAE', 'NN_RMSE', 'NN_MAE', 'LSTM_RMSE', 'LSTM_MAE', 'Hybrid_RMSE', 'Hybrid_MAE']})
-        return group_id, None, None, metrics, error_message, None, None, None # Return None for all results on fatal error
-
-
-# --- Main Function to Run Forecasting ---
-def run_forecasting(data_full_file_path, date_column, sales_column, grouping_column,
-                    time_series_frequency, test_size_days, lstm_look_back, lstm_epochs,
-                    lstm_batch_size, use_arima_model, use_ma_model, ma_q_order, use_nn_model,
-                    nn_layers, nn_units, use_lstm_model, use_bidirectional_lstm, use_hybrid_model,
-                    add_lagged_features, max_workers, output_dir):
+def enhanced_display_model_performance(group_id, consolidated_df, evaluation_summary_df,
+                                       residual_plots_data, lstm_history_data, nn_history_data,
+                                       arima_pi_data, group_column_name, date_column_name,
+                                       target_column_name, plot_df_eda_source):
     """
-    Loads data, performs feature engineering, splits data, trains models
-    in parallel, and collects results.
+    Enhanced function to display model performance charts and metrics.
+
+    Args:
+        group_id: ID of the group to display
+        consolidated_df: DataFrame with all forecasts
+        evaluation_summary_df: DataFrame with evaluation metrics
+        residual_plots_data: Dict with residual plotting data
+        lstm_history_data: Dict with LSTM training history
+        nn_history_data: Dict with NN training history
+        arima_pi_data: Dict with ARIMA prediction intervals
+        group_column_name: Name of group column
+        date_column_name: Name of date column
+        target_column_name: Name of target column
+        plot_df_eda_source: The original processed DataFrame for EDA, especially for feature analysis.
     """
+    st.write(f"### Performance for Group: {group_id}")
 
-    st.subheader("Step 1: Data Loading and Preparation")
-    try:
-        if not os.path.exists(data_full_file_path):
-            st.error(f"Error: Data file not found at '{data_full_file_path}'")
-            return # Stop execution if file not found
+    # Filter data for current group
+    plot_df_group = consolidated_df
+    if group_column_name and group_column_name in consolidated_df.columns:
+        plot_df_group = consolidated_df[consolidated_df[group_column_name] == group_id]
 
-        # Determine file type and read
-        file_ext = os.path.splitext(data_full_file_path)[1].lower()
-        if file_ext == '.csv':
-            df = pd.read_csv(data_full_file_path)
-        elif file_ext in ['.xls', '.xlsx']:
-            df = pd.read_excel(data_full_file_path)
-        else:
-            st.error(f"Unsupported file format: {file_ext}. Please use .csv or .xlsx.")
-            return
-
-        st.success(f"Successfully loaded data from '{data_full_file_path}'")
-
-        # Validate required columns exist
-        required_cols = [date_column, sales_column, grouping_column]
-        if not all(col in df.columns for col in required_cols):
-            missing = [col for col in required_cols if col not in df.columns]
-            st.error(f"Error: Missing required columns in data file: {', '.join(missing)}")
-            return
-
-        # Data Cleaning and Preparation
-        df = df.dropna(subset=[date_column, sales_column, grouping_column]) # Drop rows with missing essential data
-        df[date_column] = pd.to_datetime(df[date_column]) # Convert date column to datetime objects
-        df[sales_column] = pd.to_numeric(df[sales_column], errors='coerce') # Ensure sales is numeric, coerce errors
-        df = df.dropna(subset=[sales_column]) # Drop rows where sales could not be converted to numeric
-
-        # Sort by group and date
-        df = df.sort_values(by=[grouping_column, date_column])
-
-        # Add general time-based features *before* splitting into groups
-        df['Year'] = df[date_column].dt.year
-        df['Month'] = df[date_column].dt.month
-        df['Day'] = df[date_column].dt.day
-        df['DayOfWeek'] = df[date_column].dt.dayofweek # Monday=0, Sunday=6
-        df['DayOfYear'] = df[date_column].dt.dayofyear
-        df['WeekOfYear'] = df[date_column].dt.isocalendar().week.astype(int) # Use isocalendar for week number
-
-        st.success("Data cleaning and preparation complete.")
-        st.write("Data Head:", df.head())
-        st.write("Data Info:", df.info())
-
-    except Exception as e:
-        st.error(f"Error during data loading and preparation: {e}")
-        st.exception(e)
+    if plot_df_group.empty:
+        st.info(f"No forecast data available for group '{group_id}'")
         return
 
+    # Get the series for the current group from the EDA source for diagnostics
+    series_for_diagnostics = plot_df_eda_source.copy()
+    if group_column_name and group_column_name in plot_df_eda_source.columns:
+        series_for_diagnostics = plot_df_eda_source[plot_df_eda_source[group_column_name] == group_id].copy()
+    series_for_diagnostics = series_for_diagnostics.sort_values(by=date_column_name).set_index(date_column_name)[target_column_name]
+
+    if series_for_diagnostics.empty:
+        st.warning(f"No data available for diagnostics for group '{group_id}'")
+        return
+
+    # Display evaluation metrics
+    if evaluation_summary_df is not None:
+        if group_column_name:
+            group_metrics = evaluation_summary_df[evaluation_summary_df['group_id'] == group_id]
+        else:
+            group_metrics = evaluation_summary_df[evaluation_summary_df['group_id'] == 'Overall']
+
+        if not group_metrics.empty:
+            st.write("#### Evaluation Metrics:")
+            # Drop group_id column for cleaner display
+            metrics_display = group_metrics.drop(columns=['group_id'], errors='ignore')
+            st.dataframe(metrics_display)
+
+            # Create a bar chart of metrics
+            metrics_to_plot = {}
+            model_names = []
+
+            for col in metrics_display.columns:
+                if col.endswith('_RMSE'):
+                    model_name = col.replace('_RMSE', '')
+                    if not pd.isna(metrics_display[col].values[0]):
+                        model_names.append(model_name)
+                        metrics_to_plot[model_name] = {
+                            'RMSE': metrics_display[col].values[0],
+                            'MAE': metrics_display[f'{model_name}_MAE'].values[0] if f'{model_name}_MAE' in metrics_display.columns else None
+                        }
+
+            if model_names:
+                # Create metrics comparison bar chart
+                fig_metrics = plt.figure(figsize=(10, 6))
+                x = np.arange(len(model_names))
+                width = 0.35
+
+                rmse_values = [metrics_to_plot[model]['RMSE'] for model in model_names]
+                mae_values = [metrics_to_plot[model]['MAE'] for model in model_names]
+
+                plt.bar(x - width/2, rmse_values, width, label='RMSE')
+                plt.bar(x + width/2, mae_values, width, label='MAE')
+
+                plt.xlabel('Models')
+                plt.ylabel('Error')
+                plt.title(f'Model Comparison for {group_id}')
+                plt.xticks(x, model_names)
+                plt.legend()
+
+                st.pyplot(fig_metrics)
+
+    # Display forecast plot
+    if date_column_name in plot_df_group.columns:
+        st.write("#### Forecast Plot:")
+
+        actual_col = 'Actual'
+        forecast_cols = [col for col in plot_df_group.columns if 'Forecast' in col]
+
+        if actual_col in plot_df_group.columns and forecast_cols:
+            import plotly.graph_objects as go
+
+            # Create Plotly figure
+            fig = go.Figure()
+
+            # Add actual values
+            fig.add_trace(go.Scatter(
+                x=plot_df_group[date_column_name],
+                y=plot_df_group[actual_col],
+                mode='lines+markers',
+                name='Actual',
+                line=dict(color='black', width=2)
+            ))
+
+            # Add forecasts for each model
+            colors = ['blue', 'green', 'red', 'purple', 'orange']
+            for i, forecast_col in enumerate(forecast_cols):
+                color = colors[i % len(colors)]
+                model_name = forecast_col.replace('_Forecast', '')
+
+                fig.add_trace(go.Scatter(
+                    x=plot_df_group[date_column_name],
+                    y=plot_df_group[forecast_col],
+                    mode='lines+markers',
+                    name=f'{model_name} Forecast',
+                    line=dict(color=color)
+                ))
+
+                # Add prediction intervals for ARIMA if available
+                if model_name == 'ARIMA' and group_id in arima_pi_data:
+                    # Check if ARIMA_Upper and ARIMA_Lower columns exist in plot_df_group
+                    if 'ARIMA_Upper' in plot_df_group.columns and 'ARIMA_Lower' in plot_df_group.columns:
+                        fig.add_trace(go.Scatter(
+                            x=plot_df_group[date_column_name],
+                            y=plot_df_group['ARIMA_Upper'],
+                            mode='lines',
+                            line=dict(width=0),
+                            showlegend=False
+                        ))
+
+                        fig.add_trace(go.Scatter(
+                            x=plot_df_group[date_column_name],
+                            y=plot_df_group['ARIMA_Lower'],
+                            mode='lines',
+                            line=dict(width=0),
+                            fillcolor='rgba(0, 0, 255, 0.2)',
+                            fill='tonexty',
+                            name='ARIMA 95% CI'
+                        ))
+
+            # Update layout
+            fig.update_layout(
+                title=f'Forecast vs Actuals for {group_id}',
+                xaxis_title=date_column_name,
+                yaxis_title=target_column_name,
+                hovermode='x unified',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Display residuals and diagnostics
+    st.write("#### Residual Analysis:")
+
+    model_options = []
+    for key in residual_plots_data.keys():
+        if key.startswith(f"{group_id}_"):
+            model_name = key.replace(f"{group_id}_", "")
+            model_options.append(model_name)
+
+    if model_options:
+        selected_model = st.selectbox("Select Model for Residual Analysis:", model_options)
+
+        if selected_model:
+            residual_key = f"{group_id}_{selected_model}"
+            if residual_key in residual_plots_data:
+                residual_data = residual_plots_data[residual_key]
+                residuals = residual_data['residuals']
+                fitted = residual_data['fitted']
+
+                # Create residual plots
+                fig_residuals, axs = plt.subplots(2, 2, figsize=(14, 10))
+
+                # Residuals vs Fitted
+                axs[0, 0].scatter(fitted, residuals)
+                axs[0, 0].axhline(y=0, color='r', linestyle='-')
+                axs[0, 0].set_title('Residuals vs Fitted')
+                axs[0, 0].set_xlabel('Fitted values')
+                axs[0, 0].set_ylabel('Residuals')
+
+                # Residuals Histogram
+                axs[0, 1].hist(residuals, bins=20)
+                axs[0, 1].set_title('Residuals Distribution')
+                axs[0, 1].set_xlabel('Residuals')
+                axs[0, 1].set_ylabel('Frequency')
+
+                # QQ Plot
+                from scipy import stats
+                stats.probplot(residuals, dist="norm", plot=axs[1, 0])
+                axs[1, 0].set_title('Normal Q-Q Plot')
+
+                # Residuals Time Plot
+                axs[1, 1].plot(range(len(residuals)), residuals)
+                axs[1, 1].axhline(y=0, color='r', linestyle='-')
+                axs[1, 1].set_title('Residuals over Time')
+                axs[1, 1].set_xlabel('Time')
+                axs[1, 1].set_ylabel('Residuals')
+
+                plt.tight_layout()
+                st.pyplot(fig_residuals)
+
+                # Statistical tests
+                st.write("#### Statistical Tests on Residuals:")
+
+                # Ljung-Box test for autocorrelation
+                from statsmodels.stats.diagnostic import acorr_ljungbox
+
+                try:
+                    lb_test = acorr_ljungbox(series_for_diagnostics, lags=min(10, len(series_for_diagnostics) // 5), return_df=True)
+                    st.write("#### Ljung-Box Test for Autocorrelation")
+                    st.write("Null hypothesis: Residuals are independently distributed (no autocorrelation)")
+                    st.dataframe(lb_test)
+
+                    # Interpret results
+                    if any(lb_test['lb_pvalue'] < 0.05):
+                        st.warning("There is significant autocorrelation in the time series at some lags (p-value < 0.05).")
+                        st.write("This suggests temporal patterns that could be exploited by forecasting models.")
+                    else:
+                        st.success("No significant autocorrelation detected at the tested lags (p-value >= 0.05).")
+                except Exception as e:
+                    st.error(f"Error running Ljung-Box test: {e}")
+
+                # ACF and PACF plots
+                st.write("#### ACF and PACF Plots")
+                try:
+                    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+                    max_lags = min(40, len(series_for_diagnostics) - 1)
+
+                    plot_acf(series_for_diagnostics, lags=max_lags, ax=ax1)
+                    ax1.set_title("Autocorrelation Function (ACF)")
+
+                    plot_pacf(series_for_diagnostics, lags=max_lags, ax=ax2)
+                    ax2.set_title("Partial Autocorrelation Function (PACF)")
+
+                    plt.tight_layout()
+                    st.pyplot(fig)
+
+                    st.write("""
+                    **Interpretation Guide:**
+                    - ACF shows correlation between a time series and its lagged values
+                    - PACF shows direct correlation between a time series and its lagged values, controlling for values at intervening lags
+                    - Significant spikes at specific lags suggest potential AR or MA orders for ARIMA models
+                    """)
+                except Exception as e:
+                    st.error(f"Error creating ACF/PACF plots: {e}")
+
+                # Augmented Dickey-Fuller test for stationarity
+                from statsmodels.tsa.stattools import adfuller
+
+                st.write("#### Stationarity Test (Augmented Dickey-Fuller)")
+                try:
+                    adf_result = adfuller(series_for_diagnostics.dropna())
+
+                    adf_output = pd.Series({
+                        'Test Statistic': adf_result[0],
+                        'p-value': adf_result[1],
+                        '1% Critical Value': adf_result[4]['1%'],
+                        '5% Critical Value': adf_result[4]['5%'],
+                        '10% Critical Value': adf_result[4]['10%']
+                    })
+
+                    st.dataframe(adf_output)
+
+                    # Interpret results
+                    if adf_result[1] <= 0.05:
+                        st.success("Time series is stationary (p-value <= 0.05). This is good for forecasting!")
+                    else:
+                        st.warning("Time series is likely non-stationary (p-value > 0.05). Differencing may help.")
+
+                        # Offer differencing option
+                        if st.checkbox("Apply differencing to make series stationary"):
+                            diff_order = st.slider("Differencing order:", 1, 2, 1)
+                            diff_series = series_for_diagnostics.diff(diff_order).dropna()
+
+                            # Plot differenced series
+                            fig_diff = plt.figure(figsize=(10, 6))
+                            plt.plot(diff_series)
+                            plt.title(f"Series after {diff_order}-order differencing")
+                            plt.xlabel("Time"); plt.ylabel("Differenced Value")
+                            st.pyplot(fig_diff)
+
+                            # Re-run ADF test on differenced series
+                            adf_diff_result = adfuller(diff_series.dropna())
+                            adf_diff_output = pd.Series({
+                                'Test Statistic': adf_diff_result[0],
+                                'p-value': adf_diff_result[1],
+                                '1% Critical Value': adf_diff_result[4]['1%'],
+                                '5% Critical Value': adf_diff_result[4]['5%'],
+                                '10% Critical Value': adf_diff_result[4]['10%']
+                            })
+
+                            st.write("ADF Test on Differenced Series:")
+                            st.dataframe(adf_diff_output)
+
+                            if adf_diff_result[1] <= 0.05:
+                                st.success("Differenced series is now stationary (p-value <= 0.05).")
+                                st.info(f"Suggestion: Consider using ARIMA with d={diff_order} for this time series.")
+                            else:
+                                st.warning("Series remains non-stationary even after differencing.")
+
+                except Exception as e:
+                    st.error(f"Error running stationarity test: {e}")
+
+                # Distribution analysis
+                st.write("#### Distribution Analysis")
+                try:
+                    fig_dist, (ax_hist, ax_qq) = plt.subplots(1, 2, figsize=(12, 5))
+
+                    # Histogram with KDE
+                    sns.histplot(series_for_diagnostics, kde=True, ax=ax_hist)
+                    ax_hist.set_title("Distribution of Target Variable")
+                    ax_hist.set_xlabel(target_column_name)
+                    ax_hist.set_ylabel("Frequency")
+
+                    # QQ plot
+                    stats.probplot(series_for_diagnostics.dropna(), plot=ax_qq)
+                    ax_qq.set_title("Q-Q Plot")
+
+                    plt.tight_layout()
+                    st.pyplot(fig_dist)
+
+                    # Skewness and kurtosis
+                    skewness = series_for_diagnostics.skew()
+                    kurtosis = series_for_diagnostics.kurtosis()
+
+                    st.write(f"**Skewness**: {skewness:.4f} ({'Positively' if skewness > 0 else 'Negatively'} skewed)")
+                    st.write(f"**Kurtosis**: {kurtosis:.4f} ({'Heavy' if kurtosis > 0 else 'Light'} tailed compared to normal distribution)")
+
+                    # Normality test
+                    shapiro_test = stats.shapiro(series_for_diagnostics.sample(min(5000, len(series_for_diagnostics))) if len(series_for_diagnostics) > 5000 else series_for_diagnostics)
+                    st.write(f"**Shapiro-Wilk Test p-value**: {shapiro_test[1]:.6f}")
+                    if shapiro_test[1] < 0.05:
+                        st.warning("The data is not normally distributed (p-value < 0.05)")
+
+                        # Box-Cox transformation suggestion
+                        if st.checkbox("Apply Box-Cox transformation") and (series_for_diagnostics > 0).all():
+                            from scipy import stats
+                            transformed_data, lambda_value = stats.boxcox(series_for_diagnostics)
+
+                            # Plot transformed series
+                            fig_transform = plt.figure(figsize=(10, 6))
+                            plt.hist(transformed_data, bins=30, alpha=0.7, density=True)
+                            plt.title(f"Box-Cox Transformed Data (λ = {lambda_value:.4f})")
+                            plt.xlabel("Transformed Value")
+                            st.pyplot(fig_transform)
+
+                            # Re-test normality
+                            shapiro_transform = stats.shapiro(transformed_data[:5000] if len(transformed_data) > 5000 else transformed_data)
+                            st.write(f"**Shapiro-Wilk Test p-value after transformation**: {shapiro_transform[1]:.6f}")
+                            if shapiro_transform[1] < 0.05:
+                                st.warning("Data remains non-normal even after transformation.")
+                            else:
+                                st.success("Box-Cox transformation successfully normalized the data.")
+                                st.info("Consider using this transformation before modeling for better results.")
+                    else:
+                        st.success("The data follows a normal distribution (p-value >= 0.05)")
+                except Exception as e:
+                    st.error(f"Error in distribution analysis: {e}")
+
+                # Outlier detection
+                st.write("#### Outlier Detection")
+                try:
+                    q1 = series_for_diagnostics.quantile(0.25)
+                    q3 = series_for_diagnostics.quantile(0.75)
+                    iqr = q3 - q1
+                    lower_bound = q1 - 1.5 * iqr
+                    upper_bound = q3 + 1.5 * iqr
+
+                    outliers = series_for_diagnostics[(series_for_diagnostics < lower_bound) | (series_for_diagnostics > upper_bound)]
+                    outlier_percentage = (len(outliers) / len(series_for_diagnostics)) * 100
+
+                    st.write(f"**Number of outliers detected**: {len(outliers)} ({outlier_percentage:.2f}% of the data)")
+
+                    # Box plot for outliers
+                    fig_box = plt.figure(figsize=(10, 6))
+                    sns.boxplot(x=series_for_diagnostics)
+                    plt.title("Box Plot with Outliers")
+                    plt.xlabel(target_column_name)
+                    st.pyplot(fig_box)
+
+                    if len(outliers) > 0:
+                        st.write("**Sample of outliers:**")
+                        st.dataframe(outliers.head(10))
+
+                        if st.checkbox("Show outliers in time series"):
+                            fig_outlier_ts = plt.figure(figsize=(12, 6))
+                            plt.plot(series_for_diagnostics.index, series_for_diagnostics, 'b-', label='Original Series')
+                            plt.scatter(outliers.index, outliers, color='red', label='Outliers')
+                            plt.title("Time Series with Outliers Highlighted")
+                            plt.xlabel("Date")
+                            plt.ylabel(target_column_name)
+                            plt.legend()
+                            st.pyplot(fig_outlier_ts)
+
+                        # Option to handle outliers
+                        if st.checkbox("Handle outliers"):
+                            outlier_method = st.radio(
+                                "Select outlier handling method:",
+                                ("Cap at bounds", "Remove outliers", "Replace with median")
+                            )
+
+                            if outlier_method == "Cap at bounds":
+                                clean_series = series_for_diagnostics.copy()
+                                clean_series[clean_series < lower_bound] = lower_bound
+                                clean_series[clean_series > upper_bound] = upper_bound
+                                st.info("Outliers capped at IQR boundaries")
+                            elif outlier_method == "Remove outliers":
+                                clean_series = series_for_diagnostics[(series_for_diagnostics >= lower_bound) & (series_for_diagnostics <= upper_bound)]
+                                st.info(f"Removed {len(series_for_diagnostics) - len(clean_series)} outliers")
+                            else:  # Replace with median
+                                clean_series = series_for_diagnostics.copy()
+                                clean_series[(clean_series < lower_bound) | (clean_series > upper_bound)] = series_for_diagnostics.median()
+                                st.info("Outliers replaced with median value")
+
+                            # Plot cleaned series
+                            fig_clean = plt.figure(figsize=(12, 6))
+                            plt.plot(series_for_diagnostics.index, series_for_diagnostics, 'b-', alpha=0.5, label='Original Series')
+                            plt.plot(clean_series.index, clean_series, 'g-', label='Cleaned Series')
+                            plt.title("Original vs Cleaned Time Series")
+                            plt.xlabel("Date")
+                            plt.ylabel(target_column_name)
+                            plt.legend()
+                            st.pyplot(fig_clean)
+                    else:
+                        st.success("No outliers detected.")
+                except Exception as e:
+                    st.error(f"Error in outlier detection: {e}")
+
+            # Feature importance analysis for additional features if available
+            if st.checkbox("Analyze feature importance"):
+                feature_cols = [col for col in plot_df_eda_source.columns if col not in [date_column_name, target_column_name, group_column_name]
+                               and pd.api.types.is_numeric_dtype(plot_df_eda_source[col])]
+
+                if feature_cols:
+                    st.write("#### Feature Importance Analysis")
+
+                    # Correlation matrix
+                    st.write("**Correlation with Target Variable:**")
+                    corr_with_target = plot_df_eda_source[[target_column_name] + feature_cols].corr()[target_column_name].drop(target_column_name).sort_values(ascending=False)
+
+                    # Bar chart of correlations
+                    fig_corr = px.bar(
+                        x=corr_with_target.index,
+                        y=corr_with_target.values,
+                        labels={'x': 'Feature', 'y': f'Correlation with {target_column_name}'},
+                        title=f"Feature Correlations with {target_column_name}"
+                    )
+                    st.plotly_chart(fig_corr)
+
+                    # Full correlation heatmap
+                    st.write("**Full Correlation Matrix:**")
+                    corr_matrix = plot_df_eda_source[[target_column_name] + feature_cols].corr()
+                    fig_heatmap = px.imshow(
+                        corr_matrix,
+                        text_auto=True,
+                        aspect="auto",
+                        color_continuous_scale='RdBu_r',
+                        title="Correlation Heatmap"
+                    )
+                    st.plotly_chart(fig_heatmap)
+
+                    # Feature scatter plots
+                    st.write("**Feature Scatter Plots:**")
+                    selected_feature = st.selectbox("Select feature to plot against target:", feature_cols)
+
+                    fig_scatter = px.scatter(
+                        plot_df_eda_source,
+                        x=selected_feature,
+                        y=target_column_name,
+                        trendline="ols",
+                        title=f"{selected_feature} vs {target_column_name}"
+                    )
+                    st.plotly_chart(fig_scatter)
+
+                    # Random Forest feature importance
+                    if st.checkbox("Run Random Forest feature importance analysis"):
+                        from sklearn.ensemble import RandomForestRegressor
+                        from sklearn.model_selection import train_test_split
 
-    st.subheader("Step 2: Training Models (Parallel Processing)")
-    group_ids = df[grouping_column].unique()
-    total_groups = len(group_ids)
-    st.info(f"Found {total_groups} unique groups. Processing in parallel...")
-
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Configuration dictionary to pass to each process
-    config = {
-        'date_column': date_column,
-        'sales_column': sales_column,
-        'grouping_column': grouping_column,
-        'time_series_frequency': time_series_frequency,
-        'test_size_days': test_size_days,
-        'lstm_look_back': lstm_look_back,
-        'lstm_epochs': lstm_epochs,
-        'lstm_batch_size': lstm_batch_size,
-        'use_arima_model': use_arima_model,
-        'use_ma_model': use_ma_model,
-        'ma_q_order': ma_q_order,
-        'use_nn_model': use_nn_model,
-        'nn_layers': nn_layers,
-        'nn_units': nn_units,
-        'use_lstm_model': use_lstm_model,
-        'use_bidirectional_lstm': use_bidirectional_lstm,
-        'use_hybrid_model': use_hybrid_model, # Pass hybrid flag
-        'add_lagged_features': add_lagged_features,
-        'output_dir': output_dir # Pass output directory to processes
-    }
-
-    # Use ProcessPoolExecutor for CPU-bound tasks
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        for group_id in group_ids:
-            group_df = df[df[grouping_column] == group_id].copy()
-            # Convert group_df to JSON string to pass to process
-            # Need to convert datetime index to string before JSON serialization
-            group_df_for_json = group_df.copy()
-            # Keep original date column for split, then set index inside the process after feature engineering
-            # group_df_for_json.reset_index(inplace=True) # Reset index before JSON to keep date as column
-            group_df_for_json[date_column] = group_df_for_json[date_column].astype(str) # Convert date column to string
-            group_df_json = group_df_for_json.to_json(orient='split') # Use 'split' for easier reconstruction
-
-
-            future = executor.submit(train_and_forecast_group, group_id, group_df_json, config)
-            futures.append(future)
-
-        # Use Streamlit progress bar and status
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        completed_tasks = 0
-        for future in as_completed(futures):
-            completed_tasks += 1
-            progress = completed_tasks / total_groups
-            progress_bar.progress(progress)
-            status_text.text(f"Processing group {completed_tasks}/{total_groups}...")
-
-            group_id, group_forecasts, test_data_json, metrics, error_message, residual_data, lstm_history, nn_history = future.result()
-
-            if error_message:
-                st.warning(f"Error processing group {group_id}: {error_message}")
-                all_errors_list.append({'group_id': group_id, 'error': error_message})
-
-            if metrics:
-                all_evaluation_metrics_list.append(metrics)
-
-            if group_forecasts:
-                all_forecasts_dict[group_id] = group_forecasts
-
-            if test_data_json:
-                 # Reconstruct test_data DataFrame from JSON string
-                 test_data_group = pd.read_json(test_data_json, orient='split')
-                 test_data_group[date_column] = pd.to_datetime(test_data_group[date_column]) # Convert date back to datetime
-                 test_data_group.set_index(date_column, inplace=True) # Set index back
-                 all_test_data_dict[group_id] = test_data_group
-
-
-            if residual_data:
-                 all_residual_plots_data[group_id] = residual_data # Store residual data
-
-            if lstm_history:
-                 all_lstm_history_data[group_id] = lstm_history # Store LSTM history
-
-            if nn_history:
-                 all_nn_history_data[group_id] = nn_history # Store NN history
-
-
-        status_text.text("Parallel processing complete.")
-        progress_bar.empty() # Hide progress bar after completion
-
-    st.success("Step 2: Model training and forecasting complete for all groups.")
-
-    # --- Step 3: Consolidate and Evaluate Results ---
-    st.subheader("Step 3: Consolidate and Evaluate Results")
-
-    # Consolidate evaluation metrics
-    if all_evaluation_metrics_list:
-        evaluation_df = pd.DataFrame(all_evaluation_metrics_list)
-        st.write("Evaluation Metrics (RMSE and MAE per group):", evaluation_df)
-
-        # Calculate overall average metrics
-        avg_metrics = evaluation_df.mean(numeric_only=True).to_dict()
-        st.write("Overall Average Metrics:")
-        for metric, value in avg_metrics.items():
-             if not np.isnan(value):
-                 st.write(f"- {metric}: {value:.4f}")
-             else:
-                 st.write(f"- {metric}: N/A (Model not selected or failed)")
-
-        # Option to download evaluation metrics
-        csv_metrics = evaluation_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Download Evaluation Metrics as CSV",
-            data=csv_metrics,
-            file_name='evaluation_metrics.csv',
-            mime='text/csv',
-        )
-    else:
-        st.warning("No evaluation metrics were collected.")
-
-    # Consolidate forecasts and actual test data
-    consolidated_forecasts = []
-    consolidated_test_data = []
-    sample_group_ids = [] # To store a few group IDs for plotting
-
-    # Check if there are any successful forecasts before consolidation
-    has_successful_forecasts = any(all_forecasts_dict.values())
-
-    if all_forecasts_dict and all_test_data_dict:
-         for group_id in all_forecasts_dict.keys(): # Iterate through groups with forecasts
-             if group_id in all_test_data_dict: # Ensure test data exists for this group
-                 forecasts = all_forecasts_dict[group_id]
-                 test_data_group = all_test_data_dict[group_id].copy() # Use copied test data
-
-                 # Create a DataFrame for forecasts for this group
-                 # Ensure the index aligns with the test_data_group
-                 forecast_df_group = pd.DataFrame(test_data_group.index)
-                 forecast_df_group.columns = [date_column] # Set date column name
-                 forecast_df_group.set_index(date_column, inplace=True) # Set date as index
-
-                 # Add actual sales from test data
-                 forecast_df_group['Actual'] = test_data_group[sales_column]
-
-                 # Add forecast columns for each model that ran successfully for this group
-                 for model_name, forecast_values in forecasts.items():
-                      if forecast_values is not None and len(forecast_values) == len(test_data_group):
-                           forecast_df_group[f'{model_name}_Forecast'] = forecast_values
-                      else:
-                           forecast_df_group[f'{model_name}_Forecast'] = np.nan # Mark as NaN if forecast missing or wrong length
-
-
-                 forecast_df_group[grouping_column] = group_id # Add grouping column
-                 consolidated_forecasts.append(forecast_df_group)
-
-                 # Also consolidate test data separately if needed later, but consolidating forecasts is key for plotting
-                 # consolidated_test_data.append(test_data_group.reset_index().assign(**{grouping_column: group_id})) # Append test data with grouping column
-
-
-         if consolidated_forecasts:
-             consolidated_forecasts_df = pd.concat(consolidated_forecasts)
-             st.write("Consolidated Forecasts and Actuals (Sample Head):", consolidated_forecasts_df.head())
-
-             # Save consolidated forecasts
-             try:
-                 consolidated_forecasts_path = os.path.join(output_dir, 'consolidated_forecasts.csv')
-                 consolidated_forecasts_df.to_csv(consolidated_forecasts_path)
-                 st.success(f"Consolidated forecasts saved to '{consolidated_forecasts_path}'")
-
-                 # Option to download consolidated forecasts
-                 csv_forecasts = consolidated_forecasts_df.to_csv().encode('utf-8')
-                 st.download_button(
-                     label="Download Consolidated Forecasts as CSV",
-                     data=csv_forecasts,
-                     file_name='consolidated_forecasts.csv',
-                     mime='text/csv',
-                 )
-
-             except Exception as e:
-                 st.error(f"Error saving consolidated forecasts: {e}")
-                 st.exception(e)
-         else:
-             st.warning("No consolidated forecasts DataFrame could be created.")
-             consolidated_forecasts_df = pd.DataFrame() # Initialize empty DataFrame
-
-
-    else:
-        st.warning("No forecasts or test data were collected from group processing.")
-        consolidated_forecasts_df = pd.DataFrame() # Initialize empty DataFrame
-
-
-    # --- Step 4: Save Models and Results ---
-    st.subheader("Step 4: Saving Results")
-
-    # Save models are handled within train_and_forecast_group process
-    # Scalers are also saved within the process
-
-    # Save evaluation metrics (already handled in Step 3)
-    # Save consolidated forecasts (already handled in Step 3)
-
-    # Save residual data for plotting
-    if all_residual_plots_data:
-        try:
-            residual_plots_data_path = os.path.join(output_dir, 'residual_plots_data.joblib')
-            joblib.dump(all_residual_plots_data, residual_plots_data_path)
-            st.success(f"Residuals data for plotting saved to '{residual_plots_data_path}'")
-        except Exception as e:
-            st.error(f"Error saving residual plots data: {e}")
-            st.exception(e)
-
-    # Save LSTM training history
-    if all_lstm_history_data:
-        try:
-            lstm_history_path = os.path.join(output_dir, 'lstm_training_history.joblib')
-            joblib.dump(all_lstm_history_data, lstm_history_path)
-            st.success(f"LSTM training history saved to '{lstm_history_path}'")
-        except Exception as e:
-            st.error(f"Error saving LSTM training history: {e}")
-            st.exception(e)
-
-    # Save NN training history
-    if all_nn_history_data:
-        try:
-            nn_history_path = os.path.join(output_dir, 'nn_training_history.joblib')
-            joblib.dump(all_nn_history_data, nn_history_path)
-            st.success(f"NN training history saved to '{nn_history_path}'")
-        except Exception as e:
-            st.error(f"Error saving NN training history: {e}")
-            st.exception(e)
-
-
-    # Report errors encountered during processing
-    if all_errors_list:
-        st.subheader("Processing Errors")
-        st.error("The following errors occurred during group processing:")
-        for err in all_errors_list:
-            st.write(f"- Group ID {err['group_id']}: {err['error']}")
-
-
-    st.success("Step 4: Saving results complete.")
-
-
-    # --- Step 5: Visualize Results ---
-    st.subheader("Step 5: Visualize Results")
-
-    # Function to display individual model performance
-    def display_model_performance(group_id, consolidated_df, evaluation_df, residuals_data, date_col, sales_col, model_name, output_dir):
-        st.subheader(f"{model_name} Performance for Group {group_id}")
-
-        # Filter data for the selected group
-        group_plot_df = consolidated_df[consolidated_df[grouping_column] == group_id].copy()
-
-        if not group_plot_df.empty:
-            # Display Metrics for the specific model
-            model_metrics = evaluation_df[evaluation_df['group_id'] == group_id]
-            if not model_metrics.empty:
-                 st.write(f"Metrics for {model_name}:")
-                 rmse_col = f'{model_name}_RMSE'
-                 mae_col = f'{model_name}_MAE'
-                 rmse = model_metrics.iloc[0].get(rmse_col, np.nan)
-                 mae = model_metrics.iloc[0].get(mae_col, np.nan)
-
-                 if not np.isnan(rmse):
-                     st.write(f"- RMSE: {rmse:.4f}")
-                 else:
-                     st.write(f"- RMSE: N/A (Model failed or not selected)")
-
-                 if not np.isnan(mae):
-                     st.write(f"- MAE: {mae:.4f}")
-                 else:
-                     st.write(f"- MAE: N/A (Model failed or not selected)")
-            else:
-                 st.info(f"No evaluation metrics found for {model_name} for this group.")
-
-
-            # Actual vs. Forecasted Plot for the specific model
-            forecast_col = f'{model_name}_Forecast'
-            if forecast_col in group_plot_df.columns and not group_plot_df[forecast_col].isnull().all():
-                 plot_data = group_plot_df.reset_index().melt(
-                    id_vars=[date_col, grouping_column],
-                    value_vars=['Actual', forecast_col],
-                    var_name='Series',
-                    value_name='Sales'
-                 )
-                 plot_data['Series'] = plot_data['Series'].replace('Actual', 'Actual Sales')
-
-                 fig = px.bar(plot_data, x=date_col, y='Sales', color='Series', barmode='group',
-                               title=f'Actual vs. {model_name} Forecasted Sales for Group {group_id}')
-                 st.plotly_chart(fig, use_container_width=True)
-
-                 # Save the plot
-                 try:
-                    group_plot_dir = os.path.join(output_dir, f"plots_{group_id}")
-                    os.makedirs(group_plot_dir, exist_ok=True)
-                    plot_html_path = os.path.join(group_plot_dir, f'{model_name.lower()}_forecast_plot_{group_id}.html')
-                    fig.write_html(plot_html_path)
-                    st.success(f"{model_name} forecast plot saved as HTML to '{plot_html_path}'")
-                    try:
-                        plot_png_path = os.path.join(group_plot_dir, f'{model_name.lower()}_forecast_plot_{group_id}.png')
-                        fig.write_image(plot_png_path)
-                        st.success(f"{model_name} forecast plot saved as PNG to '{plot_png_path}'")
-                    except Exception as img_e:
-                        st.warning(f"Could not save {model_name} plot as PNG (requires kaleido engine): {img_e}")
-                 except Exception as e:
-                    st.error(f"Error saving {model_name} forecast plot for group {group_id}: {e}")
-                    st.exception(e)
-
-            else:
-                 st.info(f"No valid {model_name} forecast data available for plotting.")
-
-            # Residuals Plot for the specific model
-            if group_id in residuals_data and model_name in residuals_data[group_id] and residuals_data[group_id][model_name] is not None:
-                 residual_data_group = residuals_data[group_id]
-                 residual_df = pd.DataFrame({
-                     'Date': group_plot_df.index,
-                     f'{model_name}_Residuals': residual_data_group[model_name]
-                 })
-                 residual_df.set_index('Date', inplace=True)
-
-
-                 if not residual_df.empty:
-                    fig_residuals = px.line(residual_df.reset_index(), x='Date', y=f'{model_name}_Residuals',
-                                            title=f'{model_name} Residuals over Time for Group {group_id}')
-                    fig_residuals.add_hline(y=0, line_dash="dash", line_color="red", annotation_text="Zero Residuals")
-                    st.plotly_chart(fig_residuals, use_container_width=True)
-
-                    # Save the residual plot
-                    try:
-                        group_plot_dir = os.path.join(output_dir, f"plots_{group_id}")
-                        os.makedirs(group_plot_dir, exist_ok=True)
-                        residual_plot_html_path = os.path.join(group_plot_dir, f'{model_name.lower()}_residuals_plot_{group_id}.html')
-                        fig_residuals.write_html(residual_plot_html_path)
-                        st.success(f"{model_name} residuals plot saved as HTML to '{residual_plot_html_path}'")
                         try:
-                            residual_plot_png_path = os.path.join(group_plot_dir, f'{model_name.lower()}_residuals_plot_{group_id}.png')
-                            fig_residuals.write_image(residual_plot_png_path)
-                            st.success(f"{model_name} residuals plot saved as PNG to '{residual_plot_png_path}'")
-                        except Exception as img_e:
-                            st.warning(f"Could not save {model_name} residuals plot as PNG (requires kaleido engine): {img_e}")
-                    except Exception as e:
-                        st.error(f"Error saving {model_name} residuals plot for group {group_id}: {e}")
-                        st.exception(e)
+                            X = plot_df_eda_source[feature_cols].fillna(plot_df_eda_source[feature_cols].mean())
+                            y = plot_df_eda_source[target_column_name]
 
-                 else:
-                    st.info(f"No valid {model_name} residual data available for plotting.")
-            else:
-                 st.info(f"No residual data available for {model_name} for this group.")
+                            rf = RandomForestRegressor(n_estimators=100, random_state=42)
+                            rf.fit(X, y)
 
+                            importance_df = pd.DataFrame({
+                                'Feature': feature_cols,
+                                'Importance': rf.feature_importances_
+                            }).sort_values('Importance', ascending=False)
 
-    # This 'try' block encompasses the entire visualization step
-    try:
-        # Check if there is data to plot
-        if not consolidated_forecasts_df.empty and all_evaluation_metrics_list: # Ensure both are available
-            st.write("Select a group to visualize forecasts and residuals.")
+                            fig_imp = px.bar(
+                                importance_df,
+                                x='Feature',
+                                y='Importance',
+                                title="Random Forest Feature Importance"
+                            )
+                            st.plotly_chart(fig_imp)
 
-            # Get unique group IDs from the consolidated forecasts DataFrame
-            sample_group_ids = consolidated_forecasts_df[grouping_column].unique().tolist()
+                        except Exception as e:
+                            st.error(f"Error in Random Forest feature importance: {e}")
+                else:
+                    st.info("No additional numeric features available for importance analysis.")
 
-            if sample_group_ids:
-                selected_group_plot = st.selectbox("Choose a Group ID:", sample_group_ids)
+            # Add calendar visualization for seasonality analysis
+            if st.checkbox("Visualize calendar patterns"):
+                st.write("#### Calendar Pattern Analysis")
 
-                # Filter data for the selected group
-                group_plot_df = consolidated_forecasts_df[consolidated_forecasts_df[grouping_column] == selected_group_plot].copy()
+                # Ensure date_column_name is datetime
+                plot_df_eda_source[date_column_name] = pd.to_datetime(plot_df_eda_source[date_column_name])
 
-                if not group_plot_df.empty:
+                # Extract date components
+                date_features = pd.DataFrame({
+                    'date': plot_df_eda_source[date_column_name],
+                    'value': plot_df_eda_source[target_column_name],
+                    'year': plot_df_eda_source[date_column_name].dt.year,
+                    'month': plot_df_eda_source[date_column_name].dt.month,
+                    'day': plot_df_eda_source[date_column_name].dt.day,
+                    'dayofweek': plot_df_eda_source[date_column_name].dt.dayofweek,
+                    'quarter': plot_df_eda_source[date_column_name].dt.quarter
+                })
 
-                    # --- Model Visualization Selection ---
-                    st.subheader(f"Model Visualization Options for Group {selected_group_plot}")
-                    visualization_mode = st.radio(
-                        "Select Visualization Mode:",
-                        ('Compare All Models', 'View Individual Model Performance', 'Compare Model Metrics') # Added 'Compare Model Metrics'
+                # Select pattern to visualize
+                pattern_type = st.radio(
+                    "Select pattern to analyze:",
+                    ("Monthly", "Day of Week", "Quarterly", "Yearly")
+                )
+
+                if pattern_type == "Monthly":
+                    monthly_avg = date_features.groupby('month')['value'].mean().reset_index()
+                    monthly_avg['month_name'] = monthly_avg['month'].apply(lambda x: pd.Timestamp(2020, x, 1).strftime('%b'))
+
+                    fig_monthly = px.bar(
+                        monthly_avg,
+                        x='month_name',
+                        y='value',
+                        title="Average Target Value by Month",
+                        labels={'value': target_column_name, 'month_name': 'Month'}
+                    )
+                    st.plotly_chart(fig_monthly)
+
+                elif pattern_type == "Day of Week":
+                    dow_avg = date_features.groupby('dayofweek')['value'].mean().reset_index()
+                    dow_avg['day_name'] = dow_avg['dayofweek'].apply(lambda x: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'][x])
+
+                    fig_dow = px.bar(
+                        dow_avg,
+                        x='day_name',
+                        y='value',
+                        title="Average Target Value by Day of Week",
+                        labels={'value': target_column_name, 'day_name': 'Day of Week'}
+                    )
+                    st.plotly_chart(fig_dow)
+
+                elif pattern_type == "Quarterly":
+                    q_avg = date_features.groupby('quarter')['value'].mean().reset_index()
+                    q_avg['quarter_name'] = 'Q' + q_avg['quarter'].astype(str)
+
+                    fig_q = px.bar(
+                        q_avg,
+                        x='quarter_name',
+                        y='value',
+                        title="Average Target Value by Quarter",
+                        labels={'value': target_column_name, 'quarter_name': 'Quarter'}
+                    )
+                    st.plotly_chart(fig_q)
+
+                elif pattern_type == "Yearly":
+                    if date_features['year'].nunique() > 1:
+                        y_avg = date_features.groupby('year')['value'].mean().reset_index()
+
+                        fig_y = px.bar(
+                            y_avg,
+                            x='year',
+                            y='value',
+                            title="Average Target Value by Year",
+                            labels={'value': target_column_name, 'year': 'Year'}
+                        )
+                        st.plotly_chart(fig_y)
+
+                        # Year-over-year comparison
+                        if st.checkbox("Show year-over-year comparison"):
+                            yoy_data = date_features.pivot_table(
+                                index=['month', 'day'],
+                                columns='year',
+                                values='value',
+                                aggfunc='mean'
+                            ).reset_index()
+
+                            yoy_melted = yoy_data.melt(
+                                id_vars=['month', 'day'],
+                                var_name='year',
+                                value_name='value'
+                            )
+                            yoy_melted['date'] = yoy_melted.apply(
+                                lambda x: pd.Timestamp(2000, x['month'], x['day']), axis=1
+                            )
+
+                            fig_yoy = px.line(
+                                yoy_melted.sort_values('date'),
+                                x='date',
+                                y='value',
+                                color='year',
+                                title="Year-over-Year Comparison",
+                                labels={'value': target_column_name, 'date': 'Month and Day'}
+                            )
+                            fig_yoy.update_xaxes(
+                                tickformat="%b %d",
+                                tickmode='array',
+                                tickvals=[pd.Timestamp(2000, m, 1) for m in range(1, 13)]
+                            )
+                            st.plotly_chart(fig_yoy)
+                    else:
+                        st.info("Not enough years in the data for yearly comparison.")
+
+            # Add holiday impact analysis
+            if st.checkbox("Analyze holiday impact"):
+                st.write("#### Holiday Impact Analysis")
+
+                country_code = st.selectbox(
+                    "Select country for holidays:",
+                    ["US", "UK", "CA", "AU", "DE", "FR", "JP", "CN", "BR", "IN"]
+                )
+
+                # Ensure date_column_name is datetime
+                plot_df_eda_source[date_column_name] = pd.to_datetime(plot_df_eda_source[date_column_name])
+
+                year_range = plot_df_eda_source[date_column_name].dt.year.unique()
+                if len(year_range) > 0:
+                    country_holidays = holidays.country_holidays(
+                        country_code,
+                        years=list(year_range)
                     )
 
-                    if visualization_mode == 'Compare All Models':
-                        # --- Actual vs. Forecasted Sales Plot (Comparison) ---
-                        st.subheader(f"Actual vs. Forecasted Sales Comparison for Group {selected_group_plot}")
-                        plot_data = group_plot_df.reset_index().melt(
-                            id_vars=[date_column, grouping_column],
-                            value_vars=[col for col in group_plot_df.columns if 'Forecast' in col or col == 'Actual'],
-                            var_name='Series',
-                            value_name='Sales'
+                    # Find holiday dates in the data
+                    plot_df_eda_holiday = plot_df_eda_source.copy().reset_index()
+                    plot_df_eda_holiday['is_holiday'] = plot_df_eda_holiday[date_column_name].dt.date.apply(
+                        lambda x: x in country_holidays
+                    )
+
+                    if plot_df_eda_holiday['is_holiday'].any():
+                        # Add holiday names
+                        plot_df_eda_holiday['holiday_name'] = plot_df_eda_holiday[date_column_name].dt.date.apply(
+                            lambda x: country_holidays.get(x, "")
                         )
-                        plot_data['Series'] = plot_data['Series'].replace('Actual', 'Actual Sales')
-                        # Changed px.line to px.bar
-                        fig = px.bar(plot_data, x=date_column, y='Sales', color='Series', barmode='group',
-                                      title=f'Actual vs. Forecasted Sales for Group {selected_group_plot}')
-                        st.plotly_chart(fig, use_container_width=True)
 
-                        # Save the comparison plot
-                        try:
-                            group_plot_dir = os.path.join(output_dir, f"plots_{selected_group_plot}")
-                            os.makedirs(group_plot_dir, exist_ok=True)
-                            plot_html_path = os.path.join(group_plot_dir, f'forecast_comparison_plot_{selected_group_plot}.html')
-                            fig.write_html(plot_html_path)
-                            st.success(f"Comparison forecast plot saved as HTML to '{plot_html_path}'")
-                            try:
-                                plot_png_path = os.path.join(group_plot_dir, f'forecast_comparison_plot_{selected_group_plot}.png')
-                                fig.write_image(plot_png_path)
-                                st.success(f"Comparison forecast plot saved as PNG to '{plot_png_path}'")
-                            except Exception as img_e:
-                                st.warning(f"Could not save comparison plot as PNG (requires kaleido engine): {img_e}")
-                        except Exception as e:
-                            st.error(f"Error saving comparison forecast plot for group {selected_group_plot}: {e}")
-                            st.exception(e)
+                        # Compare holiday vs non-holiday
+                        holiday_avg = plot_df_eda_holiday.groupby('is_holiday')[target_column_name].mean()
 
+                        fig_hol = px.bar(
+                            x=['Non-Holiday', 'Holiday'],
+                            y=holiday_avg.values,
+                            title="Average Target Value: Holiday vs Non-Holiday",
+                            labels={'x': 'Day Type', 'y': target_column_name}
+                        )
+                        st.plotly_chart(fig_hol)
 
-                    elif visualization_mode == 'View Individual Model Performance':
-                        # Identify available models based on columns in the consolidated dataframe
-                        available_models = [col.replace('_Forecast', '') for col in group_plot_df.columns if '_Forecast' in col]
-                        if available_models:
-                             selected_model_plot = st.radio("Choose a Model:", available_models)
-                             # Pass the full evaluation_df to the display function
-                             display_model_performance(selected_group_plot, consolidated_forecasts_df, pd.DataFrame(all_evaluation_metrics_list), all_residual_plots_data, date_column, sales_column, selected_model_plot, output_dir)
+                        # Table of holidays and their values
+                        holiday_df = plot_df_eda_holiday[plot_df_eda_holiday['is_holiday']].copy()
+                        if not holiday_df.empty:
+                            st.write("**Holidays in the data:**")
+                            holiday_summary = holiday_df.groupby('holiday_name').agg({
+                                target_column_name: ['mean', 'count']
+                            }).reset_index()
+                            holiday_summary.columns = ['Holiday', 'Average Value', 'Count']
+                            st.dataframe(holiday_summary)
 
-                             # --- Training Loss Plot (for Sequence Models - if selected model is NN or LSTM) ---
-                             if selected_model_plot in ['LSTM', 'NN', 'Hybrid']: # Include Hybrid for potential future residual model loss
-                                  st.subheader(f"Training Loss History for Group {selected_group_plot} ({selected_model_plot})")
-                                  if selected_model_plot == 'LSTM':
-                                       loss_history = all_lstm_history_data.get(selected_group_plot)
-                                       model_label = 'LSTM'
-                                  elif selected_model_plot == 'NN': # selected_model_plot == 'NN'
-                                       loss_history = all_nn_history_data.get(selected_group_plot)
-                                       model_label = 'NN'
-                                  elif selected_model_plot == 'Hybrid':
-                                      # Assuming you might want to show the loss of the residual model within Hybrid
-                                      # Currently, the script doesn't store hybrid residual model loss history explicitly
-                                      # This part would need modification if you store hybrid residual loss
-                                      loss_history = None # Placeholder - need to store hybrid residual loss if desired
-                                      model_label = 'Hybrid Residual LSTM'
-                                      st.info("Training loss history for the Hybrid model's residual component is not currently collected.") # Inform user
+                            # Plot specific holidays
+                            st.write("**Impact of specific holidays:**")
+                            top_holidays = holiday_df['holiday_name'].value_counts().nlargest(10).index.tolist()
+                            selected_holiday = st.selectbox("Select holiday:", top_holidays)
 
+                            if selected_holiday:
+                                holiday_dates = holiday_df[holiday_df['holiday_name'] == selected_holiday][date_column_name].dt.date
 
-                                  if loss_history:
-                                       loss_df = pd.DataFrame({'Epoch': range(1, len(loss_history) + 1), 'Loss': loss_history, 'Model': model_label})
-                                       fig_loss = px.line(loss_df, x='Epoch', y='Loss',
-                                                          title=f'Training Loss History for Group {selected_group_plot} ({model_label})')
-                                       st.plotly_chart(fig_loss, use_container_width=True)
+                                # Find days around the holiday
+                                holiday_impact = pd.DataFrame()
+                                for hdate in holiday_dates:
+                                    # Get 3 days before and after
+                                    start_date = pd.Timestamp(hdate) - pd.Timedelta(days=3)
+                                    end_date = pd.Timestamp(hdate) + pd.Timedelta(days=3)
+                                    date_range = pd.date_range(start_date, end_date)
 
-                                       # Save the loss plot
-                                       try:
-                                            group_plot_dir = os.path.join(output_dir, f"plots_{selected_group_plot}")
-                                            os.makedirs(group_plot_dir, exist_ok=True)
-                                            loss_plot_html_path = os.path.join(group_plot_dir, f'{model_label.lower().replace(" ", "_")}_training_loss_plot_{selected_group_plot}.html') # Adjust filename for hybrid
-                                            fig_loss.write_html(loss_plot_html_path)
-                                            st.success(f"{model_label} training loss plot saved as HTML to '{loss_plot_html_path}'")
-                                            try:
-                                                loss_plot_png_path = os.path.join(group_plot_dir, f'{model_label.lower().replace(" ", "_")}_training_loss_plot_{selected_group_plot}.png') # Adjust filename for hybrid
-                                                fig_loss.write_image(loss_plot_png_path)
-                                                st.success(f"{model_label} training loss plot saved as PNG to '{loss_plot_png_path}'")
-                                            except Exception as img_e:
-                                                st.warning(f"Could not save {model_label} training loss plot as PNG (requires kaleido engine): {img_e}")
-                                       except Exception as e:
-                                            st.error(f"Error saving {model_label} training loss plot for group {selected_group_plot}: {e}")
-                                            st.exception(e)
+                                    # Find data for these dates
+                                    period_data = plot_df_eda_source[
+                                        (plot_df_eda_source[date_column_name] >= start_date) &
+                                        (plot_df_eda_source[date_column_name] <= end_date)
+                                    ].copy()
 
-                                  else:
-                                       # Only show this if it wasn't the placeholder message for Hybrid
-                                       if selected_model_plot != 'Hybrid':
-                                            st.info(f"No training history available for {selected_model_plot} for this group.")
+                                    if not period_data.empty:
+                                        period_data['days_from_holiday'] = (period_data[date_column_name] - pd.Timestamp(hdate)).dt.days
+                                        period_data['holiday_date'] = hdate
+                                        holiday_impact = pd.concat([holiday_impact, period_data])
 
+                                if not holiday_impact.empty:
+                                    impact_summary = holiday_impact.groupby('days_from_holiday')[target_column_name].mean().reset_index()
+                                    impact_summary['day_label'] = impact_summary['days_from_holiday'].apply(
+                                        lambda x: f"H{x:+d}" if x != 0 else "Holiday"
+                                    )
 
-                        else:
-                             st.info("No individual models available to visualize for this group.")
-
-                    elif visualization_mode == 'Compare Model Metrics':
-                         st.subheader(f"Model Performance Metrics Comparison for Group {selected_group_plot}")
-                         # Filter metrics for the selected group
-                         group_metrics_df = pd.DataFrame(all_evaluation_metrics_list)
-                         group_metrics_df = group_metrics_df[group_metrics_df['group_id'] == selected_group_plot]
-
-                         if not group_metrics_df.empty:
-                             # Prepare data for the metrics bar chart
-                             metrics_data = []
-                             for col in group_metrics_df.columns:
-                                 if col.endswith('_RMSE'):
-                                     model_name = col.replace('_RMSE', '')
-                                     rmse_value = group_metrics_df.iloc[0][col]
-                                     mae_value = group_metrics_df.iloc[0].get(f'{model_name}_MAE', np.nan) # Get MAE if exists
-                                     if not np.isnan(rmse_value):
-                                         metrics_data.append({'Model': model_name, 'Metric Type': 'RMSE', 'Value': rmse_value})
-                                     if not np.isnan(mae_value):
-                                         metrics_data.append({'Model': model_name, 'Metric Type': 'MAE', 'Value': mae_value})
-
-                             if metrics_data:
-                                 metrics_plot_df = pd.DataFrame(metrics_data)
-                                 fig_metrics = px.bar(metrics_plot_df, x='Model', y='Value', color='Metric Type', barmode='group',
-                                                      title=f'RMSE and MAE Comparison for Group {selected_group_plot}')
-                                 st.plotly_chart(fig_metrics, use_container_width=True)
-
-                                 # Save the metrics comparison plot
-                                 try:
-                                    group_plot_dir = os.path.join(output_dir, f"plots_{selected_group_plot}")
-                                    os.makedirs(group_plot_dir, exist_ok=True)
-                                    metrics_plot_html_path = os.path.join(group_plot_dir, f'metrics_comparison_plot_{selected_group_plot}.html')
-                                    fig_metrics.write_html(metrics_plot_html_path)
-                                    st.success(f"Metrics comparison plot saved as HTML to '{metrics_plot_html_path}'")
-                                    try:
-                                        metrics_plot_png_path = os.path.join(group_plot_dir, f'metrics_comparison_plot_{selected_group_plot}.png')
-                                        fig_metrics.write_image(metrics_plot_png_path)
-                                        st.success(f"Metrics comparison plot saved as PNG to '{metrics_plot_png_path}'")
-                                    except Exception as img_e:
-                                        st.warning(f"Could not save metrics comparison plot as PNG (requires kaleido engine): {img_e}")
-                                 except Exception as e:
-                                    st.error(f"Error saving metrics comparison plot for group {selected_group_plot}: {e}")
-                                    st.exception(e)
-
-
-                             else:
-                                 st.info("No valid metrics available for plotting for this group.")
-                         else:
-                             st.info(f"No evaluation metrics found for group {selected_group_plot}.")
-
-
+                                    fig_impact = px.bar(
+                                        impact_summary.sort_values('days_from_holiday'),
+                                        x='day_label',
+                                        y=target_column_name,
+                                        title=f"Impact of {selected_holiday} (Days Before and After)",
+                                        labels={'day_label': 'Day', target_column_name: target_column_name}
+                                    )
+                                    st.plotly_chart(fig_impact)
+                    else:
+                        st.info(f"No holidays from {country_code} found in the data range.")
                 else:
-                    st.info(f"No data found for the sample group ID: {selected_group_plot} for plotting forecasts/residuals.")
-            else:
-                st.info("No groups available to visualize forecasts.")
-        else:
-            st.info("Consolidated forecasts DataFrame or Evaluation Metrics are empty, cannot plot Actual vs. Forecasted Sales or compare metrics.")
-
-    # This 'except' block catches errors from the visualization 'try' block above
-    except Exception as e:
-        st.warning(f"Could not plot actual vs. forecasted sales or residuals: {e}")
-        st.exception(e)
+                    st.error("Cannot determine year range from the data.")
 
 
-    # Note: Saving results (metrics, forecasts, models) was moved to Step 4 and happens after parallel processing finishes but before plotting.
-    # This ensures results are saved even if plotting fails for a specific group.
+# ======================================================================
+# Main Streamlit Application Logic
+# ======================================================================
+
+st.set_page_config(layout="wide", page_title="Advanced Demand Forecasting App")
+
+st.title("📈 Advanced Demand Forecasting Application")
+st.markdown("Upload your time series data, configure forecasting parameters, and evaluate multiple models.")
+
+# Initialize session state variables
+if 'uploaded_file' not in st.session_state:
+    st.session_state.uploaded_file = None
+if 'df_original' not in st.session_state:
+    st.session_state.df_original = None
+if 'df_processed' not in st.session_state:
+    st.session_state.df_processed = None
+if 'forecast_results_ready' not in st.session_state:
+    st.session_state.forecast_results_ready = False
+if 'evaluation_df' not in st.session_state:
+    st.session_state.evaluation_df = None
+if 'consolidated_forecast_df' not in st.session_state:
+    st.session_state.consolidated_forecast_df = None
+if 'all_residual_plots_data' not in st.session_state:
+    st.session_state.all_residual_plots_data = None
+if 'all_lstm_history_data' not in st.session_state:
+    st.session_state.all_lstm_history_data = None
+if 'all_nn_history_data' not in st.session_state:
+    st.session_state.all_nn_history_data = None
+if 'all_arima_pi_data' not in st.session_state:
+    st.session_state.all_arima_pi_data = None
+
+# File Uploader
+uploaded_file = st.file_uploader("Upload your CSV or Excel file", type=["csv", "xlsx"])
+
+if uploaded_file is not None:
+    if uploaded_file != st.session_state.uploaded_file:
+        st.session_state.uploaded_file = uploaded_file
+        st.session_state.forecast_results_ready = False # Reset results if new file uploaded
+
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else: # .xlsx
+                df = pd.read_excel(uploaded_file)
+
+            st.session_state.df_original = df.copy()
+            st.session_state.df_processed = df.copy() # df_processed will be used for actual processing
+            st.success("File uploaded successfully!")
+            st.write("First 5 rows of your data:")
+            st.dataframe(df.head())
+
+        except Exception as e:
+            st.error(f"Error loading file: {e}")
+            st.session_state.df_original = None
+            st.session_state.df_processed = None
+            st.session_state.uploaded_file = None # Clear uploaded file to avoid re-processing on rerun
+else:
+    st.session_state.df_original = None
+    st.session_state.df_processed = None
+    st.session_state.uploaded_file = None
+    st.session_state.forecast_results_ready = False
 
 
-# --- Main App Execution ---
-if start_button:
-    # Check if at least one model is selected
-    if not (use_arima_model or use_ma_model or use_nn_model or use_lstm_model or use_hybrid_model):
-        st.warning("Please select at least one model to run.")
+if st.session_state.df_original is not None:
+    df = st.session_state.df_original.copy()
+    available_columns = df.columns.tolist()
+
+    st.sidebar.header("Configuration")
+
+    # Column selection
+    date_column = st.sidebar.selectbox("Select Date Column", available_columns)
+    target_column = st.sidebar.selectbox("Select Target Column", available_columns)
+
+    # Optional group column
+    group_column_options = [None] + available_columns
+    group_column = st.sidebar.selectbox("Select Group Column (Optional)", group_column_options, format_func=lambda x: x if x is not None else "None")
+
+    # Forecasting parameters
+    forecast_horizon = st.sidebar.number_input("Forecast Horizon (steps)", min_value=1, value=12)
+    test_size_percentage = st.sidebar.slider("Test Data Size (% of total data)", min_value=10, max_value=50, value=20)
+    lookback_window = st.sidebar.number_input("Lookback Window (for NN/LSTM)", min_value=1, value=12)
+
+    # Model selection
+    st.sidebar.subheader("Select Models to Run")
+    models_to_run = []
+    if st.sidebar.checkbox("ARIMA", value=True):
+        models_to_run.append("ARIMA")
+    if st.sidebar.checkbox("LSTM", value=True):
+        models_to_run.append("LSTM")
+    if st.sidebar.checkbox("Simple NN", value=False):
+        models_to_run.append("Simple NN")
+
+    # NN/LSTM training parameters
+    if "LSTM" in models_to_run or "Simple NN" in models_to_run:
+        st.sidebar.subheader("Neural Network Parameters")
+        nn_epochs = st.sidebar.number_input("Epochs", min_value=1, value=50)
+        nn_batch_size = st.sidebar.number_input("Batch Size", min_value=1, value=32)
     else:
-        # Check for Hybrid model dependencies
-        if use_hybrid_model and (not use_arima_model or not use_lstm_model):
-             st.warning("Hybrid ARIMA-LSTM model requires both ARIMA and LSTM models to be selected.")
+        nn_epochs = 50 # Default if not selected
+        nn_batch_size = 32 # Default if not selected
+
+    current_app_config = {
+        'date_column': date_column,
+        'target_column': target_column,
+        'group_column': group_column,
+        'forecast_horizon': forecast_horizon,
+        'test_size_percentage': test_size_percentage,
+        'lookback_window': lookback_window,
+        'nn_epochs': nn_epochs,
+        'nn_batch_size': nn_batch_size
+    }
+
+    if st.sidebar.button("Run Forecasts"):
+        if not models_to_run:
+            st.warning("Please select at least one model to run.")
         else:
-             # Run the forecasting process
-             run_forecasting(data_full_file_path, date_column, sales_column, grouping_column,
-                             time_series_frequency, test_size_days, lstm_look_back, lstm_epochs,
-                             lstm_batch_size, use_arima_model, use_ma_model, ma_q_order, use_nn_model,
-                             nn_layers, nn_units, use_lstm_model, use_bidirectional_lstm, use_hybrid_model,
-                             add_lagged_features, max_workers, output_dir)
+            with st.spinner("Processing data and running forecasts... This may take a while."):
+                # Data preprocessing steps
+                try:
+                    # Convert date column to datetime objects
+                    st.session_state.df_processed[date_column] = pd.to_datetime(st.session_state.df_processed[date_column])
+                    # Handle missing values in target column (e.g., fill with median or mean)
+                    if st.session_state.df_processed[target_column].isnull().any():
+                        st.warning(f"Missing values found in '{target_column}'. Filling with median.")
+                        st.session_state.df_processed[target_column].fillna(st.session_state.df_processed[target_column].median(), inplace=True)
+                    
+                    # Ensure target column is numeric
+                    st.session_state.df_processed[target_column] = pd.to_numeric(st.session_state.df_processed[target_column], errors='coerce')
+                    if st.session_state.df_processed[target_column].isnull().any():
+                        st.error(f"Target column '{target_column}' contains non-numeric values after conversion. Please clean your data.")
+                        st.stop()
 
+                    # Ensure sorted by date for time series analysis
+                    st.session_state.df_processed = st.session_state.df_processed.sort_values(by=date_column)
+                    
+                    run_all_forecasts(st.session_state.df_processed, current_app_config, models_to_run)
+                except Exception as e:
+                    st.error(f"Error during data processing or forecasting setup: {e}")
+                    st.session_state.forecast_results_ready = False # Reset flag
+            st.experimental_rerun() # Rerun to show results after calculations complete
 
-st.markdown("---") # Separator
-st.write("Script execution finished.")
+    if st.session_state.forecast_results_ready:
+        st.subheader("Forecasting Results")
+
+        if st.session_state.evaluation_df is not None and not st.session_state.evaluation_df.empty:
+            # Determine groups for selection
+            display_groups = ['Overall']
+            if group_column and group_column in st.session_state.df_processed.columns:
+                display_groups.extend(st.session_state.df_processed[group_column].unique().tolist())
+
+            selected_group = st.selectbox(
+                "Select a group to view detailed performance:",
+                display_groups
+            )
+
+            group_id_for_display = selected_group if selected_group != 'Overall' else None
+
+            enhanced_display_model_performance(
+                group_id=selected_group,
+                consolidated_df=st.session_state.consolidated_forecast_df,
+                evaluation_summary_df=st.session_state.evaluation_df,
+                residual_plots_data=st.session_state.all_residual_plots_data,
+                lstm_history_data=st.session_state.all_lstm_history_data,
+                nn_history_data=st.session_state.all_nn_history_data,
+                arima_pi_data=st.session_state.all_arima_pi_data,
+                group_column_name=group_column,
+                date_column_name=date_column,
+                target_column_name=target_column,
+                plot_df_eda_source=st.session_state.df_processed # Pass processed DF for EDA
+            )
+        else:
+            st.warning("No forecasting results available. Please upload data and run forecasts.")
+
+else:
+    st.info("Please upload a CSV or Excel file to get started with demand forecasting.")
